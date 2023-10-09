@@ -99,7 +99,6 @@ namespace Unity.NetCode
             if (m_DidPushTime)
             {
                 group.World.PopTime();
-                group.World.RestoreGroupAllocator(m_OldGroupAllocators);
                 m_fixedUpdateMarker.End();
             }
             else
@@ -118,6 +117,10 @@ namespace Unity.NetCode
             }
             if (m_CurrentTickAge < 0)
             {
+                if (this.m_DidPushTime)
+                {
+                    group.World.RestoreGroupAllocator(m_OldGroupAllocators);
+                }
                 m_DidPushTime = false;
                 return false;
             }
@@ -138,9 +141,14 @@ namespace Unity.NetCode
                 networkTime.Flags |= NetworkTimeFlags.IsCatchUpTick;
             networkTime.ElapsedNetworkTime += dt;
             group.World.PushTime(new TimeData(networkTime.ElapsedNetworkTime, dt));
-            m_DidPushTime = true;
-            m_OldGroupAllocators = group.World.CurrentGroupAllocators;
-            group.World.SetGroupAllocator(group.RateGroupAllocators);
+
+            if (!m_DidPushTime)
+            {
+                m_DidPushTime = true;
+                m_OldGroupAllocators = group.World.CurrentGroupAllocators;
+                group.World.SetGroupAllocator(group.RateGroupAllocators);
+            }
+
             --m_CurrentTickAge;
             m_fixedUpdateMarker.Begin();
             return true;

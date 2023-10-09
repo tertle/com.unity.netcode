@@ -10,6 +10,8 @@ using Unity.Burst.Intrinsics;
 
 namespace Unity.NetCode
 {
+    using Unity.Jobs;
+
     [RequireMatchingQueriesForUpdate]
     [WorldSystemFilter(WorldSystemFilterFlags.ClientSimulation)]
     [UpdateInGroup(typeof(PredictedSimulationSystemGroup), OrderFirst=true)]
@@ -144,7 +146,7 @@ namespace Unity.NetCode
             }
         }
     }
-    unsafe class NetcodeClientPredictionRateManager : IRateManager
+    unsafe partial class NetcodeClientPredictionRateManager : IRateManager
     {
         private EntityQuery m_NetworkTimeQuery;
         private EntityQuery m_ClientServerTickRateQuery;
@@ -155,6 +157,8 @@ namespace Unity.NetCode
 
         private EntityQuery m_GhostQuery;
         private EntityQuery m_GhostChildQuery;
+
+        private ComponentTypeHandle<Simulate> m_simulateHandle;
 
         private NetworkTick m_LastFullPredictionTick;
 
@@ -209,7 +213,29 @@ namespace Unity.NetCode
                 Options = EntityQueryOptions.IgnoreComponentEnabledState
             };
             m_GhostChildQuery = group.World.EntityManager.CreateEntityQuery(builder);
+
+            m_simulateHandle = group.GetComponentTypeHandle<Simulate>();
         }
+
+        [BurstCompile]
+        private partial struct SetEnableJob : IJobChunk
+        {
+            public bool Enable;
+
+            public ComponentTypeHandle<Simulate> SimulateHandle;
+
+            public void Execute(in ArchetypeChunk chunk, int unfilteredChunkIndex, bool useEnabledMask, in v128 chunkEnabledMask)
+            {
+                var simulates = chunk.GetEnabledMask(ref this.SimulateHandle);
+                for (var i = 0; i < chunk.Count; i++)
+                {
+                    simulates[i] = this.Enable;
+                }
+            }
+        }
+
+        private bool m_hasPushed;
+
         public bool ShouldGroupUpdate(ComponentSystemGroup group)
         {
             ref var networkTime = ref m_NetworkTimeQuery.GetSingletonRW<NetworkTime>().ValueRW;
@@ -229,6 +255,11 @@ namespace Unity.NetCode
                 {
                     uniqueInputTicks.Clear();
                     appliedPredictedTicks.Clear();
+                    if (m_hasPushed)
+                    {
+                        m_hasPushed = false;
+                        group.World.RestoreGroupAllocator(m_OldGroupAllocators);
+                    }
                     return false;
                 }
 
@@ -261,6 +292,11 @@ namespace Unity.NetCode
                 {
                     uniqueInputTicks.Clear();
                     appliedPredictedTicks.Clear();
+                    if (m_hasPushed)
+                    {
+                        m_hasPushed = false;
+                        group.World.RestoreGroupAllocator(m_OldGroupAllocators);
+                    }
                     return false;
                 }
                 bool hasNew = false;
@@ -298,8 +334,15 @@ namespace Unity.NetCode
                 networkTime.Flags |= NetworkTimeFlags.IsInPredictionLoop | NetworkTimeFlags.IsFirstPredictionTick;
                 networkTime.Flags &= ~(NetworkTimeFlags.IsFinalPredictionTick|NetworkTimeFlags.IsFinalFullPredictionTick|NetworkTimeFlags.IsFirstTimeFullyPredictingTick);
 
-                group.World.EntityManager.SetComponentEnabled<Simulate>(m_GhostQuery, false);
-                group.World.EntityManager.SetComponentEnabled<Simulate>(m_GhostChildQuery, false);
+                m_simulateHandle.Update(group);
+                var dependency = JobHandle.CombineDependencies(group.CheckedStateRef.Dependency, m_GhostQuery.GetDependency(), m_GhostChildQuery.GetDependency());
+                dependency = new SetEnableJob { Enable = false, SimulateHandle = m_simulateHandle }.ScheduleParallel(this.m_GhostQuery, dependency);
+                dependency = new SetEnableJob { Enable = false, SimulateHandle = m_simulateHandle }.ScheduleParallel(this.m_GhostChildQuery, dependency);
+                group.CheckedStateRef.Dependency = dependency;
+                group.CheckedStateRef.PushDependency();
+
+                // group.World.EntityManager.SetComponentEnabled<Simulate>(m_GhostQuery, false);
+                // group.World.EntityManager.SetComponentEnabled<Simulate>(m_GhostChildQuery, false);
 
                 m_ClientTickRateQuery.TryGetSingleton<ClientTickRate>(out var clientTickRate);
                 if (clientTickRate.MaxPredictionStepBatchSizeRepeatedTick < 1)
@@ -353,8 +396,12 @@ namespace Unity.NetCode
                 networkTime.SimulationStepBatchSize = (int)batchSize;
                 networkTime.ServerTickFraction = 1f;
                 group.World.PushTime(new TimeData(m_ElapsedTime - m_FixedTimeStep*tickAge, m_FixedTimeStep*batchSize));
-                m_OldGroupAllocators = group.World.CurrentGroupAllocators;
-                group.World.SetGroupAllocator(group.RateGroupAllocators);
+                if (!m_hasPushed)
+                {
+                    m_hasPushed = true;
+                    m_OldGroupAllocators = group.World.CurrentGroupAllocators;
+                    group.World.SetGroupAllocator(group.RateGroupAllocators);
+                }
                 return true;
             }
 
@@ -370,13 +417,26 @@ namespace Unity.NetCode
                 networkTime.Flags |= NetworkTimeFlags.IsFinalPredictionTick;
                 networkTime.Flags &= ~(NetworkTimeFlags.IsFinalFullPredictionTick | NetworkTimeFlags.IsFirstTimeFullyPredictingTick);
                 group.World.PushTime(new TimeData(group.World.Time.ElapsedTime, m_FixedTimeStep * m_CurrentTime.ServerTickFraction));
-                m_OldGroupAllocators = group.World.CurrentGroupAllocators;
-                group.World.SetGroupAllocator(group.RateGroupAllocators);
+                if (!m_hasPushed)
+                {
+                    m_hasPushed = true;
+                    m_OldGroupAllocators = group.World.CurrentGroupAllocators;
+                    group.World.SetGroupAllocator(group.RateGroupAllocators);
+                }
+
                 ++m_TickIdx;
                 return true;
             }
-            group.World.EntityManager.SetComponentEnabled<Simulate>(m_GhostQuery, true);
-            group.World.EntityManager.SetComponentEnabled<Simulate>(m_GhostChildQuery, true);
+
+            m_simulateHandle.Update(group);
+            var dependency1 = JobHandle.CombineDependencies(group.CheckedStateRef.Dependency, m_GhostQuery.GetDependency(), m_GhostChildQuery.GetDependency());
+            dependency1 = new SetEnableJob { Enable = true, SimulateHandle = m_simulateHandle }.ScheduleParallel(this.m_GhostQuery, dependency1);
+            dependency1 = new SetEnableJob { Enable = true, SimulateHandle = m_simulateHandle }.ScheduleParallel(this.m_GhostChildQuery, dependency1);
+            group.CheckedStateRef.Dependency = dependency1;
+            group.CheckedStateRef.PushDependency();
+
+            // group.World.EntityManager.SetComponentEnabled<Simulate>(m_GhostQuery, true);
+            // group.World.EntityManager.SetComponentEnabled<Simulate>(m_GhostChildQuery, true);
 #if UNITY_EDITOR || NETCODE_DEBUG
             if (!networkTime.IsFinalPredictionTick)
                 throw new InvalidOperationException("IsFinalPredictionTick should not be set before executing the final prediction tick");
@@ -393,6 +453,11 @@ namespace Unity.NetCode
                                    NetworkTimeFlags.IsFirstTimeFullyPredictingTick);
             networkTime.SimulationStepBatchSize = m_CurrentTime.SimulationStepBatchSize;
             m_TickIdx = 0;
+            if (m_hasPushed)
+            {
+                m_hasPushed = false;
+                group.World.RestoreGroupAllocator(m_OldGroupAllocators);
+            }
             return false;
         }
         public float Timestep
@@ -449,13 +514,14 @@ namespace Unity.NetCode
 #endif
         }
 
+        private bool _pushed;
+
         public bool ShouldGroupUpdate(ComponentSystemGroup group)
         {
             // if this is true, means we're being called a second or later time in a loop
             if (m_RemainingUpdates > 0)
             {
                 group.World.PopTime();
-                group.World.RestoreGroupAllocator(m_OldGroupAllocators);
                 --m_RemainingUpdates;
             }
             else if(m_TimeStep > 0f)
@@ -463,13 +529,29 @@ namespace Unity.NetCode
                 // Add epsilon to account for floating point inaccuracy
                 m_RemainingUpdates = (int)((group.World.Time.DeltaTime + 0.001f) / m_TimeStep);
             }
+
             if (m_RemainingUpdates == 0)
+            {
+                if (_pushed)
+                {
+                    group.World.RestoreGroupAllocator(m_OldGroupAllocators);
+                    _pushed = false;
+                }
+
                 return false;
+            }
+
             group.World.PushTime(new TimeData(
                 elapsedTime: group.World.Time.ElapsedTime - (m_RemainingUpdates-1)*m_TimeStep,
                 deltaTime: m_TimeStep));
-            m_OldGroupAllocators = group.World.CurrentGroupAllocators;
-            group.World.SetGroupAllocator(group.RateGroupAllocators);
+
+            if (!_pushed)
+            {
+                _pushed = true;
+                m_OldGroupAllocators = group.World.CurrentGroupAllocators;
+                group.World.SetGroupAllocator(group.RateGroupAllocators);
+            }
+
             return true;
         }
     }
