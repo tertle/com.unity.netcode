@@ -53,9 +53,6 @@ namespace Unity.NetCode.Samples.Common
         MeshRenderer m_ClientInterpolatedMeshRenderer;
         MeshRenderer m_ClientPredictedMeshRenderer;
         MeshRenderer m_ServerMeshRenderer;
-        EntityQuery m_InterpolatedGhostQuery;
-        EntityQuery m_PredictedGhostQuery;
-        EntityQuery m_MissingDebugMeshBoundsQuery;
 
         [RuntimeInitializeOnLoadMethod]
         [InitializeOnLoadMethod]
@@ -205,8 +202,14 @@ namespace Unity.NetCode.Samples.Common
 
             var serverSystem = serverWorld.GetOrCreateSystemManaged<BoundingBoxDebugGhostDrawerServerSystem>();
 
-            var numInterpolatedEntities = m_InterpolatedGhostQuery.CalculateEntityCount();
-            var numPredictedEntities = m_PredictedGhostQuery.CalculateEntityCount();
+            var predictedGhostQuery =
+                SystemAPI.QueryBuilder().WithAll<GhostDebugMeshBounds, GhostInstance, LocalToWorld>().WithAll<PredictedGhost>().Build();
+
+            var interpolatedGhostQuery =
+                SystemAPI.QueryBuilder().WithAll<GhostDebugMeshBounds, GhostInstance, LocalToWorld>().WithNone<PredictedGhost>().Build();
+
+            var numInterpolatedEntities = interpolatedGhostQuery.CalculateEntityCount();
+            var numPredictedEntities = predictedGhostQuery.CalculateEntityCount();
             var numEntitiesToIterate = numPredictedEntities + numInterpolatedEntities;
 
             serverSystem.SpawnedGhostEntityMapSingletonQuery.CompleteDependency();
@@ -222,23 +225,26 @@ namespace Unity.NetCode.Samples.Common
             
 #if USING_ENTITIES_GRAPHICS
             // GameObject side, this needs to be done at the GO's Initialization. You can use GhostDebugMeshBounds's Initialize
-            if (m_MissingDebugMeshBoundsQuery.CalculateEntityCount() > 0)
+            if (!SystemAPI.QueryBuilder().WithAll<RenderBounds, GhostInstance, LocalToWorld>().WithNone<GhostDebugMeshBounds>().Build().IsEmptyIgnoreFilter)
             {
                 // Add a GhostDebugMeshBounds component to all predicted ghosts that don't have one.
                 // This way, we don't have our size changing as the bounds are moving around. We rely on rotation to tell us the real rotation
                 var ecb = new EntityCommandBuffer(Allocator.Temp);
-                Entities
-                    .WithNone<GhostDebugMeshBounds>()
+
+
+                foreach (var (bounds, en) in SystemAPI
+                    .Query<RenderBounds>()
                     .WithAll<GhostInstance, LocalToWorld>()
-                    .WithStoreEntityQueryInField(ref m_MissingDebugMeshBoundsQuery)
-                    .ForEach((in Entity en, in RenderBounds bounds) =>
+                    .WithNone<GhostDebugMeshBounds>()
+                    .WithEntityAccess())
+                {
+                    if (math.lengthsq(bounds.Value.Extents) > 0.001f)
                     {
-                        if (math.lengthsq(bounds.Value.Extents) > 0.001f)
-                        {
-                            Bounds b = new Bounds(bounds.Value.Center, bounds.Value.Extents * 2);
-                            ecb.AddComponent(en, new GhostDebugMeshBounds { GlobalBounds = b });
-                        }
-                    }).Run();
+                        Bounds b = new Bounds(bounds.Value.Center, bounds.Value.Extents * 2);
+                        ecb.AddComponent(en, new GhostDebugMeshBounds { GlobalBounds = b });
+                    }
+                }
+
                 ecb.Playback(base.EntityManager);
             }
 #endif
@@ -250,17 +256,11 @@ namespace Unity.NetCode.Samples.Common
 
                 using (s_CreateGeometryJobMarker.Auto())
                 {
-                    Entities
-                        .WithName("CreateGeometryWithPredictedGhosts")
-                        .WithStoreEntityQueryInField(ref m_PredictedGhostQuery)
-                        .WithReadOnly(serverLocalToWorldMap)
-                        .WithReadOnly(serverSpawnedGhostEntityMap)
-                        .WithAll<PredictedGhost>()
-                        .ForEach((in GhostDebugMeshBounds debugHelper, in GhostInstance ghostComponent, in LocalToWorld transform) =>
-                        {
-                            AABB aabb = new AABB() { Center = debugHelper.GlobalBounds.center, Extents = debugHelper.GlobalBounds.extents };
-                            CreateLineGeometryWithGhosts(in aabb, in transform, in ghostComponent, in serverSpawnedGhostEntityMap, in serverLocalToWorldMap, ref predictedClientVertices, ref predictedClientIndices, ref serverVertices, ref serverIndices);
-                        }).Run();
+                    foreach (var (debugHelper, ghostComponent, transform) in SystemAPI.Query<GhostDebugMeshBounds, GhostInstance, LocalToWorld>().WithAll<PredictedGhost>())
+                    {
+                        AABB aabb = new AABB() { Center = debugHelper.GlobalBounds.center, Extents = debugHelper.GlobalBounds.extents };
+                        CreateLineGeometryWithGhosts(in aabb, in transform, in ghostComponent, in serverSpawnedGhostEntityMap, in serverLocalToWorldMap, ref predictedClientVertices, ref predictedClientIndices, ref serverVertices, ref serverIndices);
+                    }
                 }
 
                 UpdateIndividualMeshOptimized(m_PredictedClientMesh, ref predictedClientVertices, ref predictedClientIndices);
@@ -277,17 +277,11 @@ namespace Unity.NetCode.Samples.Common
 
                 using (s_CreateGeometryJobMarker.Auto())
                 {
-                    Entities
-                        .WithName("CreateGeometryWithInterpolatedGhosts")
-                        .WithStoreEntityQueryInField(ref m_InterpolatedGhostQuery)
-                        .WithReadOnly(serverLocalToWorldMap)
-                        .WithReadOnly(serverSpawnedGhostEntityMap)
-                        .WithNone<PredictedGhost>()
-                        .ForEach((in GhostDebugMeshBounds debugHelper, in GhostInstance ghostComponent, in LocalToWorld transform) =>
-                        {
-                            AABB aabb = new AABB() { Center = debugHelper.GlobalBounds.center, Extents = debugHelper.GlobalBounds.extents };
-                            CreateLineGeometryWithGhosts(in aabb, in transform, in ghostComponent, in serverSpawnedGhostEntityMap, in serverLocalToWorldMap, ref interpolatedClientVertices, ref interpolatedClientIndices, ref serverVertices, ref serverIndices);
-                        }).Run();
+                    foreach (var (debugHelper, ghostComponent, transform) in SystemAPI.Query<GhostDebugMeshBounds, GhostInstance, LocalToWorld>().WithNone<PredictedGhost>())
+                    {
+                        AABB aabb = new AABB() { Center = debugHelper.GlobalBounds.center, Extents = debugHelper.GlobalBounds.extents };
+                        CreateLineGeometryWithGhosts(in aabb, in transform, in ghostComponent, in serverSpawnedGhostEntityMap, in serverLocalToWorldMap, ref interpolatedClientVertices, ref interpolatedClientIndices, ref serverVertices, ref serverIndices);
+                    }
                 }
 
                 UpdateIndividualMeshOptimized(m_InterpolatedClientMesh, ref interpolatedClientVertices, ref interpolatedClientIndices);
@@ -304,25 +298,20 @@ namespace Unity.NetCode.Samples.Common
                 {
                     var serverL2Ws = serverSystem.GhostL2WQuery.ToComponentDataArray<LocalToWorld>(Allocator.Temp);
                     var scale = GhostServerMarkerScale * .5f;
-                    Job
-                        .WithReadOnly(serverL2Ws)
-                        .WithDisposeOnCompletion(serverL2Ws)
-                        .WithCode(() =>
-                        {
-                            var x = new float3(scale, 0, 0);
-                            var y = new float3(0, scale, 0);
-                            var z = new float3(0, 0, scale);
-                            serverVertices.Capacity = math.max(serverVertices.Capacity, serverVertices.Length + serverL2Ws.Length * 6);
-                            serverIndices.Capacity = math.max(serverIndices.Capacity, serverIndices.Length + serverL2Ws.Length * 6);
 
-                            for (var i = 0; i < serverL2Ws.Length; i++)
-                            {
-                                var pos = serverL2Ws[i].Position;
-                                DebugDrawLine(pos - x, pos + x, ref serverVertices, ref serverIndices);
-                                DebugDrawLine(pos - y, pos + y, ref serverVertices, ref serverIndices);
-                                DebugDrawLine(pos - z, pos + z, ref serverVertices, ref serverIndices);
-                            }
-                        }).Run();
+                    var x = new float3(scale, 0, 0);
+                    var y = new float3(0, scale, 0);
+                    var z = new float3(0, 0, scale);
+                    serverVertices.Capacity = math.max(serverVertices.Capacity, serverVertices.Length + serverL2Ws.Length * 6);
+                    serverIndices.Capacity = math.max(serverIndices.Capacity, serverIndices.Length + serverL2Ws.Length * 6);
+
+                    for (var i = 0; i < serverL2Ws.Length; i++)
+                    {
+                        var pos = serverL2Ws[i].Position;
+                        DebugDrawLine(pos - x, pos + x, ref serverVertices, ref serverIndices);
+                        DebugDrawLine(pos - y, pos + y, ref serverVertices, ref serverIndices);
+                        DebugDrawLine(pos - z, pos + z, ref serverVertices, ref serverIndices);
+                    }
                 }
             }
 

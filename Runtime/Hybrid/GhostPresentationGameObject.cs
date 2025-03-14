@@ -103,11 +103,8 @@ namespace Unity.NetCode.Hybrid
         }
         protected override void OnUpdate()
         {
-            Entities
-                .WithStructuralChanges()
-                .WithoutBurst()
-                .WithNone<GhostPresentationGameObjectState>()
-                .ForEach((Entity entity, in GhostPresentationGameObjectPrefabReference presentation) =>
+            foreach (var (presentation, entity) in SystemAPI.Query<GhostPresentationGameObjectPrefabReference>()
+                .WithNone<GhostPresentationGameObjectState>().WithEntityAccess())
             {
                 var goPrefabEntity = EntityManager.GetComponentData<GhostPresentationGameObjectPrefab>(presentation.Prefab);
                 var goPrefab = World.IsServer() ? goPrefabEntity.Server : goPrefabEntity.Client;
@@ -126,14 +123,11 @@ namespace Unity.NetCode.Hybrid
                     m_Transforms.Add(go.transform);
                 }
                 EntityManager.AddComponentData(entity, new GhostPresentationGameObjectState{GameObjectIndex = idx});
-            }).Run();
+            }
 
             var ghostPresentationGameObjectStateFromEntity = GetComponentLookup<GhostPresentationGameObjectState>();
-            Entities
-                .WithStructuralChanges()
-                .WithNone<GhostPresentationGameObjectPrefabReference>()
-                .WithAll<GhostPresentationGameObjectState>()
-                .ForEach((Entity entity) =>
+            foreach (var (_, entity) in SystemAPI.Query<GhostPresentationGameObjectState>()
+                .WithNone<GhostPresentationGameObjectPrefabReference>().WithEntityAccess())
             {
                 var state = ghostPresentationGameObjectStateFromEntity[entity];
                 int idx = state.GameObjectIndex;
@@ -151,7 +145,7 @@ namespace Unity.NetCode.Hybrid
                     }
                 }
                 EntityManager.RemoveComponent<GhostPresentationGameObjectState>(entity);
-            }).Run();
+            }
         }
     }
 

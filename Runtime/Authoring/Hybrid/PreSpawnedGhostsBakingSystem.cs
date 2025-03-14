@@ -40,7 +40,7 @@ namespace Unity.NetCode
             var hashToEntity = new NativeParallelHashMap<ulong, Entity>(128, Allocator.TempJob);
 
             // TODO: Check that the GhostAuthoringComponent is interpolated, as we don't support predicted atm
-            Entities.ForEach((Entity entity, in GhostAuthoringComponentBakingData ghostAuthoringBakingData) =>
+            foreach (var (ghostAuthoringBakingData, entity) in SystemAPI.Query<GhostAuthoringComponentBakingData>().WithEntityAccess())
             {
                 var isInSubscene = EntityManager.HasComponent<SceneSection>(entity);
                 bool isPrefab = ghostAuthoringBakingData.IsPrefab;
@@ -92,7 +92,7 @@ namespace Unity.NetCode
                     else
                         Debug.LogError($"Two ghosts can't be in the same exact position and rotation {EntityManager.GetName(entity)}");
                 }
-            }).WithoutBurst().Run();
+            }
 
             if (hashToEntity.Count() > 0)
             {

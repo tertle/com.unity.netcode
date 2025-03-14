@@ -630,7 +630,7 @@ namespace Unity.NetCode
         /// <param name="componentCounts">List of number of components on each index.</param>
         /// <param name="target"><see cref="NetcodeConversionTarget"/></param>
         /// <param name="prefabTypes">List of different types of <see cref="GhostPrefabType"/> to created.</param>
-        public static void FinalizePrefabComponents(Config ghostConfig, EntityManager entityManager,
+        public static void FinalizePrefabComponents(Config ghostConfig, EntityCommandBuffer ecb,
             Entity rootEntity, GhostType ghostType, NativeArray<Entity> linkedEntities,
             NativeList<ComponentType> allComponents, NativeArray<int> componentCounts,
             NetcodeConversionTarget target, NativeArray<GhostPrefabType> prefabTypes)
@@ -660,7 +660,7 @@ namespace Unity.NetCode
                     var prefabType = prefabTypes[i];
                     if((prefabType & GhostPrefabType.Server) == 0)
                     {
-                        entityManager.RemoveComponent(entities[i], comp);
+                        ecb.RemoveComponent(entities[i], comp);
                         if(typeof(ICommandData).IsAssignableFrom(comp.GetManagedType()))
                             UnityEngine.Debug.LogWarning($"{ghostConfig.Name}: ICommandData {comp} is configured to be present only on client ghosts. Will be removed from from the server target");
                     }
@@ -687,17 +687,17 @@ namespace Unity.NetCode
 
                     if ((prefabType & GhostPrefabType.Client) == 0)
                     {
-                        entityManager.RemoveComponent(entities[i], comp);
+                        ecb.RemoveComponent(entities[i], comp);
                         removedFromClient[i] = true;
                     }
                     else if (ghostConfig.SupportedGhostModes == GhostModeMask.Interpolated && (prefabType & GhostPrefabType.InterpolatedClient) == 0)
                     {
-                        entityManager.RemoveComponent(entities[i], comp);
+                        ecb.RemoveComponent(entities[i], comp);
                         removedFromClient[i] = true;
                     }
                     else if (ghostConfig.SupportedGhostModes == GhostModeMask.Predicted && (prefabType & GhostPrefabType.PredictedClient) == 0)
                     {
-                        entityManager.RemoveComponent(entities[i], comp);
+                        ecb.RemoveComponent(entities[i], comp);
                         removedFromClient[i] = true;
                     }
                 }
@@ -713,7 +713,7 @@ namespace Unity.NetCode
                     var prefabType = prefabTypes[i];
                     if ((prefabType & (GhostPrefabType.InterpolatedClient | GhostPrefabType.Server)) == 0)
                     {
-                        entityManager.RemoveComponent(entities[i], comp);
+                        ecb.RemoveComponent(entities[i], comp);
                         removedFromClient[i] = true;
                     }
                 }
@@ -726,7 +726,7 @@ namespace Unity.NetCode
                     var prefabType = prefabTypes[i];
                     if ((prefabType & (GhostPrefabType.PredictedClient | GhostPrefabType.Server)) == 0)
                     {
-                        entityManager.RemoveComponent(entities[i], comp);
+                        ecb.RemoveComponent(entities[i], comp);
                         removedFromClient[i] = true;
                         if(typeof(ICommandData).IsAssignableFrom(comp.GetManagedType()))
                             UnityEngine.Debug.LogWarning($"{ghostConfig.Name}: ICommandData {comp} is configured to be present only on interpolated ghost. Will be removed from the client and server target");
@@ -741,28 +741,28 @@ namespace Unity.NetCode
                     var prefabType = prefabTypes[i];
                     if (prefabType == 0)
                     {
-                        entityManager.RemoveComponent(entities[i], comp);
+                        ecb.RemoveComponent(entities[i], comp);
                         removedFromClient[i] = true;
                     }
                 }
             }
 
-            entityManager.AddComponentData(rootEntity, ghostType);
+            ecb.AddComponent(rootEntity, ghostType);
 
             // FIXME: maybe stripping should be individual systems running before this to make sure it can be changed in a way that always triggers a reconvert - and to avoid reflection
 
             // we must add a shared ghost type to make sure different ghost types with the same archetype end up in different chunks. The problem
             // rely on the fact that ghosts with the same archetype may have different serialization rules. And the majority of the works (done on a per-chunk basis)
             // assumes that the chunks contains ghosts of the same type (in term or serialization).
-            entityManager.AddSharedComponent(rootEntity, new GhostTypePartition {SharedValue = ghostType});
+            ecb.AddSharedComponent(rootEntity, new GhostTypePartition {SharedValue = ghostType});
 
             // All types have the ghost components
-            entityManager.AddComponentData(rootEntity, new GhostInstance());
+            ecb.AddComponent(rootEntity, new GhostInstance());
             // No need to add the predicted ghost component for interpolated only ghosts if the data is only used by the client
             if (target != NetcodeConversionTarget.Client || ghostConfig.SupportedGhostModes != GhostModeMask.Interpolated)
-                entityManager.AddComponentData(rootEntity, new PredictedGhost());
+                ecb.AddComponent(rootEntity, new PredictedGhost());
             if (ghostConfig.UsePreSerialization)
-                entityManager.AddComponentData(rootEntity, default(PreSerializedGhost));
+                ecb.AddComponent(rootEntity, default(PreSerializedGhost));
 
             var hasBuffers = false;
             //Check if the entity has any buffers left and SnapshotDynamicData buffer to for client. Must be stripped on server
@@ -773,10 +773,10 @@ namespace Unity.NetCode
                 for (int i = 0; i < allComponents.Length && !hasBuffers; ++i)
                     hasBuffers |= (allComponents[i].IsBuffer && !removedFromClient[i]) && (prefabTypes[i] & GhostPrefabType.Client) != 0;
                 // Converting to client or client and server, if client and server this should be stripped from servers at runtime
-                entityManager.AddComponentData(rootEntity, new SnapshotData());
-                entityManager.AddBuffer<SnapshotDataBuffer>(rootEntity);
+                ecb.AddComponent(rootEntity, new SnapshotData());
+                ecb.AddBuffer<SnapshotDataBuffer>(rootEntity);
                 if(hasBuffers)
-                    entityManager.AddBuffer<SnapshotDynamicDataBuffer>(rootEntity);
+                    ecb.AddBuffer<SnapshotDynamicDataBuffer>(rootEntity);
             }
 
         }
@@ -953,8 +953,12 @@ namespace Unity.NetCode
             if(target != NetcodeConversionTarget.Server && config.SupportedGhostModes != GhostModeMask.Interpolated)
                 entityManager.AddComponent<PredictedGhostSpawnRequest>(prefab);
 
-            FinalizePrefabComponents(config, entityManager, prefab, ghostType, linkedEntitiesArray,
+            var ecb = new EntityCommandBuffer(Allocator.Temp);
+
+            FinalizePrefabComponents(config, ecb, prefab, ghostType, linkedEntitiesArray,
                         allComponents, componentCounts, target, prefabTypes);
+
+            ecb.Playback(entityManager);
 
             using var codePrefabQuery = entityManager.CreateEntityQuery(new EntityQueryBuilder(Allocator.Temp).WithAll<CodeGhostPrefab>());
             if (!codePrefabQuery.TryGetSingletonEntity<CodeGhostPrefab>(out var codePrefabSingleton))
