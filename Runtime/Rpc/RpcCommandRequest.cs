@@ -2,6 +2,9 @@
 #define NETCODE_DEBUG
 #endif
 using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Linq;
 using System.Runtime.CompilerServices;
 using Unity.Collections;
 using Unity.Entities;
@@ -61,7 +64,7 @@ namespace Unity.NetCode
         }
 
         /// <summary>
-        ///     <see cref="ReceiveRpcCommandRequest"/> has a <see cref="WarnAboutStaleRpcSystem"/> which will log a warning if this <see cref="Age"/> value exceeds <see cref="WarnAboutStaleRpcSystem.MaxRpcAgeFrames"/>.
+        ///     <see cref="ReceiveRpcCommandRequest"/> has a <see cref="WarnAboutStaleRpcSystem"/> which will log a warning if this <see cref="Age"/> value exceeds <see cref="NetDebug.MaxRpcAgeFrames"/>.
         ///     Counts simulation frames.
         ///     0 is the simulation frame it is received on.
         /// </summary>
@@ -109,8 +112,8 @@ namespace Unity.NetCode
         where TActionSerializer : unmanaged, IRpcCommandSerializer<TActionRequest>
     {
         /// <summary>
-        /// A struct that can be embedded into your system job, and should be used to delegate the rpc handling.
-        /// Example of use:
+        /// <para>A struct that can be embedded into your system job, and should be used to delegate the rpc handling.
+        /// Example of use:</para>
         /// <code>
         /// [BurstCompile]
         /// struct SendRpc : IJobChunk
@@ -122,8 +125,8 @@ namespace Unity.NetCode
         ///     }
         /// }
         /// </code>
-        /// Always use the <see cref="RpcCommandRequest{TActionSerializer,TActionRequest}.InitJobData"/> method to construct
-        /// a valid instance.
+        /// <para>Always use the <see cref="RpcCommandRequest{TActionSerializer,TActionRequest}.InitJobData"/> method to construct
+        /// a valid instance.</para>
         /// </summary>
         public struct SendRpcData
         {
@@ -132,51 +135,150 @@ namespace Unity.NetCode
             [ReadOnly] internal ComponentTypeHandle<SendRpcCommandRequest> rpcRequestType;
             [ReadOnly] internal ComponentTypeHandle<TActionRequest> actionRequestType;
             [ReadOnly] internal ComponentLookup<GhostInstance> ghostFromEntity;
+            [ReadOnly] internal ComponentLookup<NetworkId> networkIdLookup;
+            [ReadOnly] internal ComponentLookup<NetworkStreamConnection> networkStreamConnectionLookup;
             internal BufferLookup<OutgoingRpcDataStreamBuffer> rpcFromEntity;
             internal RpcQueue<TActionSerializer, TActionRequest> rpcQueue;
             [ReadOnly] internal NativeList<Entity> connections;
+            internal NetDebug netDebug;
+            internal byte requireConnectionApproval;
+            internal byte isApprovalRpc;
+            internal byte isServer;
+            internal FixedString128Bytes worldName;
+            internal NativeArray<NetCodeConnectionEvent>.ReadOnly connectionEventsForTick;
 
+            // Process all send requests
             void LambdaMethod(Entity entity, int orderIndex, in SendRpcCommandRequest dest, in TActionRequest action)
             {
                 commandBuffer.DestroyEntity(orderIndex, entity);
-                if (connections.Length > 0)
+                if (dest.TargetConnection != Entity.Null)
                 {
-                    if (dest.TargetConnection != Entity.Null)
-                    {
-                        if (!rpcFromEntity.HasBuffer(dest.TargetConnection))
-                        {
-#if ENABLE_UNITY_COLLECTIONS_CHECKS
-                            UnityEngine.Debug.LogWarning("Cannot send RPC with no remote connection.");
-#endif
-                            return;
-                        }
-                        var buffer = rpcFromEntity[dest.TargetConnection];
-                        rpcQueue.Schedule(buffer, ghostFromEntity, action);
-                    }
-                    else
-                    {
-                        for (var i = 0; i < connections.Length; ++i)
-                        {
-                            var buffer = rpcFromEntity[connections[i]];
-                            rpcQueue.Schedule(buffer, ghostFromEntity, action);
-                        }
-                    }
+                    ValidateIncorrectApprovalUsage(dest.TargetConnection, false);
+                    ValidateAndQueueRpc(dest.TargetConnection, false, action);
                 }
-#if ENABLE_UNITY_COLLECTIONS_CHECKS
                 else
                 {
-                    UnityEngine.Debug.LogWarning("Cannot send RPC with no remote connection.");
+                    if (connections.Length == 0)
+                    {
+#if ENABLE_UNITY_COLLECTIONS_CHECKS
+                        var msg = isServer != 0
+                            ? $"[{worldName}] Cannot broadcast RPC '{ComponentType.ReadOnly<TActionRequest>().GetDebugTypeName()}' as no remote connections. I.e. No `NetworkStreamConnection` entities found, as no clients connected to this server."
+                            : $"[{worldName}] Cannot send RPC '{ComponentType.ReadOnly<TActionRequest>().GetDebugTypeName()}' to the server as not connected to one! I.e. No `NetworkStreamConnection` entity, as this client world is not connected (nor connecting) to any server.";
+                        if (!AnyDisconnectEvents(connectionEventsForTick))
+                            netDebug.LogWarning(msg);
+                        else netDebug.DebugLog(msg);
+                        static bool AnyDisconnectEvents(NativeArray<NetCodeConnectionEvent>.ReadOnly eventsForTickLocal)
+                        {
+                            foreach (var evt in eventsForTickLocal)
+                                if (evt.State == ConnectionState.State.Disconnected)
+                                    return true;
+                            return false;
+                        }
+#endif
+                        return;
+                    }
 
+                    ValidateIncorrectApprovalUsage(connections[0], isServer != 0);
+                    for (var i = 0; i < connections.Length; ++i)
+                    {
+                        ValidateAndQueueRpc(connections[i], isServer != 0, action);
+                    }
+                }
+            }
+
+            private void ValidateAndQueueRpc(Entity connectionEntity, bool isBroadcast, in TActionRequest action)
+            {
+                // TODO - If cleanup components are removed (and/or structural changes disallowed),
+                // add error if you assign an incorrect Entity to the TargetConnection by checking entityExists.
+                if (!networkStreamConnectionLookup.TryGetComponent(connectionEntity, out var networkStreamConnection)
+                    || !rpcFromEntity.TryGetBuffer(connectionEntity, out var buffer))
+                {
+#if ENABLE_UNITY_COLLECTIONS_CHECKS
+                    if (isBroadcast || FindDidJustDisconnect(connectionEntity))
+                        netDebug.DebugLog($"{Prefix(true, connectionEntity)} as they just disconnected.");
+                    else
+                        netDebug.LogWarning($"{Prefix(false, connectionEntity)} as its connection entity ({connectionEntity.ToFixedString()}) does not have a `NetworkStreamConnection` or `OutgoingRpcDataStreamBuffer` component (anymore?). Did you assign the correct entity?");
+#endif
                     return;
+                }
+
+                var isHandshakeOrApproval = networkStreamConnection.IsHandshakeOrApproval;
+                if (isHandshakeOrApproval)
+                {
+                    if (isApprovalRpc == 0)
+                    {
+#if ENABLE_UNITY_COLLECTIONS_CHECKS
+                        FixedString512Bytes msg = $"{Prefix(isBroadcast, connectionEntity)} as it is not an Approval RPC, and its {networkStreamConnection.Value.ToFixedString()} - on {connectionEntity.ToFixedString()} - is in state `{networkStreamConnection.CurrentState.ToFixedString()}`!";
+                        if (isBroadcast)
+                            netDebug.DebugLog(msg);
+                        else
+                        {
+                            msg.Append((FixedString128Bytes)" You MUST wait for Handshake and Approval to complete, OR convert this RPC to an `IApprovalRpcCommand`!");
+                            netDebug.LogError(msg);
+                        }
+#endif
+                        return;
+                    }
+                }
+                else
+                {
+                    var isConnected = networkStreamConnection.CurrentState == ConnectionState.State.Connected && networkIdLookup.HasComponent(connectionEntity);
+                    if (!isConnected)
+                    {
+#if ENABLE_UNITY_COLLECTIONS_CHECKS
+                        FixedString512Bytes msg = $"{Prefix(isBroadcast, connectionEntity)} as its {networkStreamConnection.Value.ToFixedString()} - on {connectionEntity.ToFixedString()} - is in state `{networkStreamConnection.CurrentState.ToFixedString()}`!";
+                        if (isBroadcast)
+                            netDebug.DebugLog(msg);
+                        else netDebug.LogError(msg);
+#endif
+                        return;
+                    }
+                }
+
+                rpcQueue.Schedule(buffer, ghostFromEntity, action);
+            }
+
+            private bool FindDidJustDisconnect(Entity entity)
+            {
+                foreach (var evt  in connectionEventsForTick)
+                {
+                    if (evt.State == ConnectionState.State.Disconnected && evt.ConnectionEntity == entity)
+                        return true;
+                }
+                return false;
+            }
+
+            [Conditional("ENABLE_UNITY_COLLECTIONS_CHECKS")]
+            private void ValidateIncorrectApprovalUsage(Entity connectionEntity, bool isBroadcast)
+            {
+#if ENABLE_UNITY_COLLECTIONS_CHECKS
+                if (requireConnectionApproval == 0 && isApprovalRpc == 1 && !netDebug.SuppressApprovalRpcSentWhenApprovalFlowDisabledWarning)
+                {
+                    FixedString512Bytes msg = isBroadcast
+                        ? $"[{worldName}] Broadcasting approval RPC '{ComponentType.ReadOnly<TActionRequest>().GetDebugTypeName()}' but connection approval is disabled. We will still attempt to broadcast the RPC."
+                        : $"[{worldName}] Sending approval RPC '{ComponentType.ReadOnly<TActionRequest>().GetDebugTypeName()}' to {Target(connectionEntity)} but connection approval is disabled. We will still attempt to send the RPC.";
+                    msg.Append((FixedString128Bytes)" If intentional, suppress via `NetDebug.SuppressApprovalRpcSentWhenApprovalFlowDisabledWarning`.");
+                    netDebug.LogWarning(msg);
                 }
 #endif
             }
 
+#if ENABLE_UNITY_COLLECTIONS_CHECKS
+            FixedString512Bytes Prefix(bool isBroadcast, Entity connectionEntity)
+            {
+                return isBroadcast
+                    ? $"[{worldName}] Broadcast of RPC '{ComponentType.ReadOnly<TActionRequest>().GetDebugTypeName()}' will skip client connection {connectionEntity.ToFixedString()}"
+                    : $"[{worldName}] Cannot send RPC '{ComponentType.ReadOnly<TActionRequest>().GetDebugTypeName()}' to {Target(connectionEntity)}";
+            }
+
+            private FixedString128Bytes Target(Entity connectionEntity) => isServer == 0 ? $"the server" : $"TargetConnection:{connectionEntity.ToFixedString()}";
+#endif
+
             /// <summary>
-            /// Call this from an <see cref="IJobChunk.Execute"/> method to handle the rpc requests.
+            /// Call this from a <see cref="IJobChunk.Execute"/> method to handle the rpc requests.
             /// </summary>
-            /// <param name="chunk"></param>
-            /// <param name="orderIndex"></param>
+            /// <param name="chunk">Chunk</param>
+            /// <param name="orderIndex">Order index</param>
             public void Execute(ArchetypeChunk chunk, int orderIndex)
             {
                 var entities = chunk.GetNativeArray(entitiesType);
@@ -203,6 +305,8 @@ namespace Unity.NetCode
         private RpcQueue<TActionSerializer, TActionRequest> m_RpcQueue;
         private EntityQuery m_ConnectionsQuery;
         private EntityQuery m_CommandBufferQuery;
+        private EntityQuery m_NetDebugQuery;
+        private EntityQuery m_NetworkStreamDriver;
         /// <summary>
         /// The query to use when scheduling the processing job.
         /// </summary>
@@ -212,7 +316,10 @@ namespace Unity.NetCode
         ComponentTypeHandle<SendRpcCommandRequest> m_SendRpcCommandRequestComponentHandle;
         ComponentTypeHandle<TActionRequest> m_TActionRequestHandle;
         ComponentLookup<GhostInstance> m_GhostComponentFromEntity;
+        ComponentLookup<NetworkId> m_NetworkIdLookup;
+        ComponentLookup<NetworkStreamConnection> m_NetworkStreamConnectionLookup;
         BufferLookup<OutgoingRpcDataStreamBuffer> m_OutgoingRpcDataStreamBufferComponentFromEntity;
+        bool m_IsApprovalRpc;
 
         /// <summary>
         /// Initialize the helper struct, should be called from OnCreate in an ISystem.
@@ -228,18 +335,30 @@ namespace Unity.NetCode
             builder.WithAll<SendRpcCommandRequest, TActionRequest>();
             Query = state.GetEntityQuery(builder);
             builder.Reset();
-            builder.WithAll<NetworkId>();
+            builder.WithAll<NetworkStreamConnection>();
             m_ConnectionsQuery = state.GetEntityQuery(builder);
             builder.Reset();
             builder.WithAll<BeginSimulationEntityCommandBufferSystem.Singleton>();
             builder.WithOptions(EntityQueryOptions.IncludeSystems);
             m_CommandBufferQuery = state.GetEntityQuery(builder);
+            builder.Reset();
+            builder.WithAll<NetDebug>();
+            m_NetDebugQuery = state.GetEntityQuery(builder);
+            builder.Reset();
+            builder.WithAll<NetworkStreamDriver>();
+            m_NetworkStreamDriver = state.GetEntityQuery(builder);
 
             m_EntityTypeHandle = state.GetEntityTypeHandle();
             m_SendRpcCommandRequestComponentHandle = state.GetComponentTypeHandle<SendRpcCommandRequest>(true);
             m_TActionRequestHandle = state.GetComponentTypeHandle<TActionRequest>(true);
             m_GhostComponentFromEntity = state.GetComponentLookup<GhostInstance>(true);
+            m_NetworkIdLookup = state.GetComponentLookup<NetworkId>(true);
+            m_NetworkStreamConnectionLookup = state.GetComponentLookup<NetworkStreamConnection>(true);
             m_OutgoingRpcDataStreamBufferComponentFromEntity = state.GetBufferLookup<OutgoingRpcDataStreamBuffer>();
+
+            var componentsManagedType = ComponentType.ReadWrite<TActionRequest>().GetManagedType();
+            if (RpcCollection.IsApprovalRpcType(componentsManagedType))
+                m_IsApprovalRpc = true;
 
             state.RequireForUpdate(Query);
         }
@@ -251,13 +370,16 @@ namespace Unity.NetCode
         /// <returns><see cref="SendRpcData"/> initialized using <paramref name="state"/></returns>
         public SendRpcData InitJobData(ref SystemState state)
         {
+            var connections = m_ConnectionsQuery.ToEntityListAsync(state.WorldUpdateAllocator,
+                out var connectionsHandle);
             m_EntityTypeHandle.Update(ref state);
             m_SendRpcCommandRequestComponentHandle.Update(ref state);
             m_TActionRequestHandle.Update(ref state);
             m_GhostComponentFromEntity.Update(ref state);
+            m_NetworkIdLookup.Update(ref state);
+            m_NetworkStreamConnectionLookup.Update(ref state);
             m_OutgoingRpcDataStreamBufferComponentFromEntity.Update(ref state);
-            var connections = m_ConnectionsQuery.ToEntityListAsync(state.WorldUpdateAllocator,
-                out var connectionsHandle);
+            var nsd = m_NetworkStreamDriver.GetSingleton<NetworkStreamDriver>();
             var sendJob = new SendRpcData
             {
                 commandBuffer = m_CommandBufferQuery.GetSingleton<BeginSimulationEntityCommandBufferSystem.Singleton>().CreateCommandBuffer(state.WorldUnmanaged).AsParallelWriter(),
@@ -266,8 +388,16 @@ namespace Unity.NetCode
                 actionRequestType = m_TActionRequestHandle,
                 ghostFromEntity = m_GhostComponentFromEntity,
                 rpcFromEntity = m_OutgoingRpcDataStreamBufferComponentFromEntity,
+                networkIdLookup = m_NetworkIdLookup,
+                networkStreamConnectionLookup = m_NetworkStreamConnectionLookup,
                 rpcQueue = m_RpcQueue,
                 connections = connections,
+                connectionEventsForTick = nsd.ConnectionEventsForTick,
+                netDebug = m_NetDebugQuery.GetSingleton<NetDebug>(),
+                requireConnectionApproval = nsd.RequireConnectionApproval ? (byte)1 : (byte)0,
+                isApprovalRpc = m_IsApprovalRpc ? (byte)1 : (byte)0,
+                isServer = state.WorldUnmanaged.IsServer() ? (byte)1 : (byte)0,
+                worldName = state.WorldUnmanaged.Name,
             };
             state.Dependency = JobHandle.CombineDependencies(state.Dependency, connectionsHandle);
             return sendJob;

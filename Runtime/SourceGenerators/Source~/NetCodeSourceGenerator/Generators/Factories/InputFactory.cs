@@ -9,6 +9,7 @@ namespace Unity.NetCode.Generators
         public static void Generate(IReadOnlyList<SyntaxNode> inputCandidates, CodeGenerator.Context codeGenContext, GeneratorExecutionContext executionContext)
         {
             var typeBuilder = new TypeInformationBuilder(codeGenContext.diagnostic, codeGenContext.executionContext, TypeInformationBuilder.SerializationMode.Commands);
+            var rootNamespace = codeGenContext.generatedNs;
             foreach (var syntaxNode in inputCandidates)
             {
                 codeGenContext.executionContext.CancellationToken.ThrowIfCancellationRequested();
@@ -26,15 +27,16 @@ namespace Unity.NetCode.Generators
                 }
 
                 codeGenContext.ResetState();
-                codeGenContext.generatorName = Roslyn.Extensions.GetTypeNameWithDeclaringTypename(candidateSymbol);
                 var typeInfo = typeBuilder.BuildTypeInformation(candidateSymbol, null);
+                NameUtils.UpdateNameAndNamespace(ref typeInfo, rootNamespace, ref codeGenContext, ref candidateSymbol);
                 if (typeInfo == null)
                     continue;
-
                 codeGenContext.types.Add(typeInfo);
                 codeGenContext.diagnostic.LogInfo($"Generating command data wrapper for ${typeInfo.TypeFullName}");
                 CodeGenerator.GenerateCommand(codeGenContext, typeInfo, CommandSerializer.Type.Input);
             }
+
+            codeGenContext.generatedNs = rootNamespace;
         }
         static private string GetSyncInputName(INamedTypeSymbol symbol)
         {

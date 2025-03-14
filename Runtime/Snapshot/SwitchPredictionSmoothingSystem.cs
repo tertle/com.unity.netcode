@@ -38,8 +38,8 @@ namespace Unity.NetCode
     }
 
     /// <summary>
-    /// System that manage the prediction transition for all ghost that present a <see cref="SwitchPredictionSmoothing"/>
-    /// components.
+    /// <para>System that manage the prediction transition for all ghost that present a <see cref="SwitchPredictionSmoothing"/>
+    /// components.</para>
     /// <para>
     /// The system applying a visual smoohting to the ghost, by modifying the entity <see cref="LocalToWorld"/> matrix.
     /// When the transition is completed, the system removes the <see cref="SwitchPredictionSmoothing"/> component.
@@ -135,7 +135,7 @@ namespace Unity.NetCode
                         if (smoothing.CurrentFactor == 0)
                         {
                             smoothing.InitialPosition = transforms[i].Position - smoothing.InitialPosition;
-                            smoothing.InitialRotation = math.mul(transforms[i].Rotation, math.inverse(smoothing.InitialRotation));
+                            smoothing.InitialRotation = math.mul(math.inverse(smoothing.InitialRotation), transforms[i].Rotation);
                         }
 
                         smoothing.CurrentFactor = math.saturate(smoothing.CurrentFactor + DeltaTime / smoothing.Duration);

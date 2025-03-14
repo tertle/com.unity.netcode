@@ -16,6 +16,8 @@ namespace Unity.NetCode.Generators
         public static void Generate(IReadOnlyList<SyntaxNode> commandCandidates, CodeGenerator.Context codeGenContext)
         {
             var typeBuilder = new TypeInformationBuilder(codeGenContext.diagnostic, codeGenContext.executionContext, TypeInformationBuilder.SerializationMode.Commands);
+            var rootNamespace = codeGenContext.generatedNs;
+
             foreach (var syntaxNode in commandCandidates)
             {
                 codeGenContext.executionContext.CancellationToken.ThrowIfCancellationRequested();
@@ -48,12 +50,14 @@ namespace Unity.NetCode.Generators
                 var typeInfo = typeBuilder.BuildTypeInformation(candidateSymbol, null);
                 if (typeInfo == null)
                     continue;
+
+                NameUtils.UpdateNameAndNamespace(ref typeInfo, rootNamespace, ref codeGenContext, ref candidateSymbol);
                 codeGenContext.diagnostic.LogInfo($"Generating command for {typeInfo.TypeFullName}");
                 codeGenContext.types.Add(typeInfo);
                 codeGenContext.ResetState();
-                codeGenContext.generatorName = Roslyn.Extensions.GetTypeNameWithDeclaringTypename(candidateSymbol);
                 CodeGenerator.GenerateCommand(codeGenContext, typeInfo, CommandSerializer.Type.Command);
             }
+            codeGenContext.generatedNs = rootNamespace;
         }
         static private string GetCommandSerializerName(INamedTypeSymbol symbol)
         {

@@ -1,7 +1,9 @@
+using System;
 using Unity.Entities;
 using Unity.Mathematics;
 using Unity.NetCode.LowLevel.Unsafe;
 using Unity.Networking.Transport.Utilities;
+using Unity.Profiling;
 
 namespace Unity.NetCode
 {
@@ -41,6 +43,14 @@ namespace Unity.NetCode
             /// </summary>
             public int AfterIdx;
             /// <summary>
+            /// The required values of the <see cref="GhostComponentAttribute.OwnerSendType"/> property in order for a component to be sent.
+            /// The mask depends on the presence and value of the <see cref="GhostOwner"/> component:
+            /// <see cref="SendToOwnerType.All"/> if the <see cref="GhostOwner"/> is not present on the entity
+            /// <see cref="SendToOwnerType.SendToOwner"/> if the value of the <see cref="GhostOwner"/> is equals to the <see cref="NetworkId"/> of the client.
+            /// <see cref="SendToOwnerType.SendToNonOwner"/> if the value of the <see cref="GhostOwner"/> is different than the <see cref="NetworkId"/> of the client.
+            /// </summary>
+            public SendToOwnerType RequiredOwnerSendMask;
+            /// <summary>
             /// The network id of the client owning the ghost. 0 if the ghost does not have a <see cref="NetCode.GhostOwner"/>.
             /// </summary>
             public int GhostOwner;
@@ -60,7 +70,7 @@ namespace Unity.NetCode
         /// </summary>
         /// <param name="buffer"></param>
         /// <returns>A valid tick if the buffer is not empty, otherwise 0.</returns>
-        internal unsafe NetworkTick GetLatestTick(in DynamicBuffer<SnapshotDataBuffer> buffer)
+        readonly internal unsafe NetworkTick GetLatestTick(in DynamicBuffer<SnapshotDataBuffer> buffer)
         {
             if (buffer.Length == 0)
                 return NetworkTick.Invalid;
@@ -73,7 +83,7 @@ namespace Unity.NetCode
         /// </summary>
         /// <param name="buffer"></param>
         /// <returns>a valid tick if the buffer is not empty, 0 otherwise </returns>
-        internal unsafe NetworkTick GetOldestTick(in DynamicBuffer<SnapshotDataBuffer> buffer)
+        readonly internal unsafe NetworkTick GetOldestTick(in DynamicBuffer<SnapshotDataBuffer> buffer)
         {
             if (buffer.Length == 0)
                 return NetworkTick.Invalid;
@@ -93,6 +103,24 @@ namespace Unity.NetCode
 
             snapshotData = (byte*)buffer.GetUnsafeReadOnlyPtr() + LatestIndex * SnapshotSize;
             return new NetworkTick{SerializedData = *(uint*)snapshotData};
+        }
+        /// <summary>
+        /// Returns the snapshot index 'reverseOffset' back from the 'LatestIndex'. So 0 will return the snapshot index at LatestIndex
+        /// 12 will return the snapshot index at LatestIndex-12 correcly wrapping if the index goes negative
+        /// </summary>
+        /// <param name="reverseOffset"></param>
+        /// <returns>The snapshot index 'reverseOffset' back from the LatestIndex, returns null on an error </returns>
+        internal unsafe int GetPreviousSnapshotIndexAtOffset(int reverseOffset)
+        {
+            if (reverseOffset > GhostSystemConstants.SnapshotHistorySize)
+                return LatestIndex;
+
+            var previousIndex = (LatestIndex - reverseOffset);
+            if (previousIndex < 0)
+            {
+                previousIndex += GhostSystemConstants.SnapshotHistorySize;
+            }
+            return previousIndex;
         }
         /// <summary>
         /// Determine it the latest snapshot received by the server has not changes (all changemasks were 0).
@@ -121,12 +149,15 @@ namespace Unity.NetCode
         /// </summary>
         /// <param name="targetTick"></param>
         /// <param name="predictionOwnerOffset"></param>
+        /// <param name="localNetworkId"></param>
         /// <param name="targetTickFraction"></param>
         /// <param name="buffer"></param>
         /// <param name="data"></param>
         /// <param name="MaxExtrapolationTicks"></param>
         /// <returns>True if at least one snapshot has been received and if its tick is less or equal the current target tick.</returns>
-        internal unsafe bool GetDataAtTick(NetworkTick targetTick, int predictionOwnerOffset, float targetTickFraction, in DynamicBuffer<SnapshotDataBuffer> buffer, out DataAtTick data, uint MaxExtrapolationTicks)
+        internal unsafe bool GetDataAtTick(NetworkTick targetTick, int predictionOwnerOffset,
+            int localNetworkId, float targetTickFraction, in DynamicBuffer<SnapshotDataBuffer> buffer,
+            out DataAtTick data, uint MaxExtrapolationTicks)
         {
             data = default;
             if (buffer.Length == 0)
@@ -141,11 +172,13 @@ namespace Unity.NetCode
                 targetTick.Decrement();
             // Loop from latest available to oldest available snapshot
             int slot;
+            var bufferData = (byte*)buffer.GetUnsafeReadOnlyPtr();
             for (slot = 0; slot < numBuffers; ++slot)
             {
                 var curIndex = (LatestIndex + GhostSystemConstants.SnapshotHistorySize - slot) % GhostSystemConstants.SnapshotHistorySize;
-                var snapshotData = (byte*)buffer.GetUnsafeReadOnlyPtr() + curIndex * SnapshotSize;
+                var snapshotData = bufferData + curIndex * SnapshotSize;
                 var tick = new NetworkTick{SerializedData = *(uint*)snapshotData};
+                //var tick = new NetworkTick{SerializedData = Ticks[curIndex]};
                 if (!tick.IsValid)
                     continue;
                 if (tick.IsNewerThan(targetTick))
@@ -160,15 +193,19 @@ namespace Unity.NetCode
                     break;
                 }
             }
-
             if (!beforeTick.IsValid)
             {
                 return false;
             }
-
-            data.SnapshotBefore = (System.IntPtr)((byte*)buffer.GetUnsafeReadOnlyPtr() + beforeIdx * SnapshotSize);
+            data.SnapshotBefore = (System.IntPtr)(bufferData + beforeIdx * SnapshotSize);
             data.Tick = beforeTick;
             data.GhostOwner = predictionOwnerOffset != 0 ? *(int*) (data.SnapshotBefore + predictionOwnerOffset) : 0;
+            if (predictionOwnerOffset == 0)
+                data.RequiredOwnerSendMask = SendToOwnerType.All;
+            else if (localNetworkId == data.GhostOwner)
+                data.RequiredOwnerSendMask = SendToOwnerType.SendToOwner;
+            else
+                data.RequiredOwnerSendMask = SendToOwnerType.SendToNonOwner;
             if (!afterTick.IsValid)
             {
                 data.BeforeIdx = beforeIdx;
@@ -179,8 +216,9 @@ namespace Unity.NetCode
                     for (++slot; slot < numBuffers; ++slot)
                     {
                         var curIndex = (LatestIndex + GhostSystemConstants.SnapshotHistorySize - slot) % GhostSystemConstants.SnapshotHistorySize;
-                        var snapshotData = (byte*)buffer.GetUnsafeReadOnlyPtr() + curIndex * SnapshotSize;
+                        var snapshotData = bufferData + curIndex * SnapshotSize;
                         var tick = new NetworkTick{SerializedData = *(uint*)snapshotData};
+                        //var tick = new NetworkTick{SerializedData = Ticks[curIndex]};
                         if (!tick.IsValid)
                             continue;
                         beforeBeforeTick = tick;
@@ -191,7 +229,7 @@ namespace Unity.NetCode
                 if (beforeBeforeTick.IsValid)
                 {
                     data.AfterIdx = beforeBeforeIdx;
-                    data.SnapshotAfter = (System.IntPtr)((byte*)buffer.GetUnsafeReadOnlyPtr() + beforeBeforeIdx * SnapshotSize);
+                    data.SnapshotAfter = (System.IntPtr)(bufferData + beforeBeforeIdx * SnapshotSize);
 
                     if (targetTick.TicksSince(beforeTick) > MaxExtrapolationTicks)
                     {
@@ -214,12 +252,11 @@ namespace Unity.NetCode
             {
                 data.BeforeIdx = beforeIdx;
                 data.AfterIdx = afterIdx;
-                data.SnapshotAfter = (System.IntPtr)((byte*)buffer.GetUnsafeReadOnlyPtr() + afterIdx * SnapshotSize);
+                data.SnapshotAfter = (System.IntPtr)(bufferData + afterIdx * SnapshotSize);
                 data.InterpolationFactor = (float) (targetTick.TicksSince(beforeTick)) / (float) (afterTick.TicksSince(beforeTick));
                 if (targetTickFraction < 1)
                     data.InterpolationFactor += targetTickFraction / (float) (afterTick.TicksSince(beforeTick));
             }
-
             return true;
         }
     }
@@ -269,8 +306,8 @@ namespace Unity.NetCode
         /// Get the size of the header at the beginning of the dynamic snapshot buffer. The size
         /// of the header is constant.
         /// </summary>
-        /// <returns></returns>
-        static public uint GetHeaderSize()
+        /// <returns>Size of the header at the beginning of the dynamic snapshot buffer</returns>
+        public static uint GetHeaderSize()
         {
             return (uint)GhostComponentSerializer.SnapshotSizeAligned(sizeof(uint) * GhostSystemConstants.SnapshotHistorySize);
         }
@@ -278,12 +315,12 @@ namespace Unity.NetCode
         /// <summary>
         /// Retrieve the dynamic buffer history slot pointer
         /// </summary>
-        /// <param name="dynamicDataBuffer"></param>
-        /// <param name="historyPosition"></param>
-        /// <param name="bufferLength"></param>
-        /// <returns></returns>
-        /// <exception cref="System.IndexOutOfRangeException"></exception>
-        /// <exception cref="System.InvalidOperationException"></exception>
+        /// <param name="dynamicDataBuffer">Dynamic data buffer</param>
+        /// <param name="historyPosition">history position in buffer</param>
+        /// <param name="bufferLength">Length of buffer</param>
+        /// <returns>pointer to dynamic buffer</returns>
+        /// <exception cref="System.IndexOutOfRangeException">Thrown if the position is invalid</exception>
+        /// <exception cref="System.InvalidOperationException">Thrown if bufferlength is less than headersize</exception>
         static public byte* GetDynamicDataPtr(byte* dynamicDataBuffer, int historyPosition, int bufferLength)
         {
             var headerSize = GetHeaderSize();
@@ -300,9 +337,9 @@ namespace Unity.NetCode
         /// <summary>
         /// Return the currently available space (masks + buffer data) available in each slot.
         /// </summary>
-        /// <param name="headerSize"></param>
-        /// <param name="length"></param>
-        /// <returns></returns>
+        /// <param name="headerSize">Header size</param>
+        /// <param name="length">Length</param>
+        /// <returns>The currently available space (masks + buffer data) available in each slot</returns>
         static public uint GetDynamicDataCapacity(uint headerSize, int length)
         {
             if (length < headerSize)
@@ -314,9 +351,9 @@ namespace Unity.NetCode
         /// Return the history buffer capacity and the resulting size of each history buffer slot necessary to store
         /// the given dynamic data size.
         /// </summary>
-        /// <param name="dynamicDataSize"></param>
-        /// <param name="slotSize"></param>
-        /// <returns></returns>
+        /// <param name="dynamicDataSize">Dynamic data size</param>
+        /// <param name="slotSize">Slot size</param>
+        /// <returns>History buffer capacity</returns>
         static public uint CalculateBufferCapacity(uint dynamicDataSize, out uint slotSize)
         {
             var headerSize = GetHeaderSize();
@@ -328,12 +365,12 @@ namespace Unity.NetCode
         /// <summary>
         /// Compute the size of the bitmask for the given number of elements and mask bits. The size is aligned to 16 bytes.
         /// </summary>
-        /// <param name="changeMaskBits"></param>
-        /// <param name="numElements"></param>
-        /// <returns></returns>
+        /// <param name="changeMaskBits">Change mask bits</param>
+        /// <param name="numElements">Number of elements</param>
+        /// <returns>Size of bitmask</returns>
         public static int GetDynamicDataChangeMaskSize(int changeMaskBits, int numElements)
         {
-            return GhostComponentSerializer.SnapshotSizeAligned(GhostComponentSerializer.ChangeMaskArraySizeInUInts((numElements * changeMaskBits)*4));
+            return GhostComponentSerializer.SnapshotSizeAligned(GhostComponentSerializer.ChangeMaskArraySizeInUInts(numElements * changeMaskBits)*4);
         }
     }
 }

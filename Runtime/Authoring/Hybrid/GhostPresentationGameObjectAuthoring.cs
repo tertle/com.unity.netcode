@@ -23,12 +23,12 @@ namespace Unity.NetCode.Hybrid
     {
         /// <summary>
         /// The GameObject prefab which should be used as a visual representation of an entity on the server.
-        /// <seealso cref="GhostPresentationGameObjectPrefab"/> for further information.
+        /// See <see cref="GhostPresentationGameObjectPrefab"/> for further information.
         /// </summary>
         public GameObject ServerPrefab;
         /// <summary>
         /// The GameObject prefab which should be used as a visual representation of an entity on the client.
-        /// <seealso cref="GhostPresentationGameObjectPrefab"/> for further information.
+        /// See <see cref="GhostPresentationGameObjectPrefab"/> for further information.
         /// </summary>
         public GameObject ClientPrefab;
         private EntityManager regEntityManager;
@@ -39,7 +39,7 @@ namespace Unity.NetCode.Hybrid
         /// Implementation of <see cref="IRegisterPlayableData"/>. Should not be called directly. It is invoked as part
         /// of the GhostAnimationController initialization.
         /// </summary>
-        /// <typeparam name="T"></typeparam>
+        /// <typeparam name="T">PlayableComponent type</typeparam>
         public void RegisterPlayableData<T>() where T: unmanaged, IComponentData
         {
             regEntityManager.AddComponentData(regEntity, default(T));

@@ -307,10 +307,7 @@ namespace Unity.NetCode.Generators
                     //Normalize filename for hint purpose. Special characters are not supported anymore
                     //var hintName = uniqueName.Replace('/', '_').Replace('+', '-');
                     //TODO: compute a normalized hash of that name using a common stable hash algorithm
-                    var uniqueName = string.IsNullOrEmpty(nameAndSource.Namespace)
-                        ? nameAndSource.GeneratedClassName
-                        : $"{nameAndSource.Namespace}_{nameAndSource.GeneratedClassName}";
-                    var sourcePath = Path.Combine($"{executionContext.Compilation.AssemblyName}", uniqueName);
+                    var sourcePath = Path.Combine($"{executionContext.Compilation.AssemblyName}", nameAndSource.GeneratedFileName);
                     var hintName = Utilities.TypeHash.FNV1A64(sourcePath).ToString();
                     //With the new version of roslyn, is necessary to add to the generate file
                     //a first line with #line1 "sourcecodefullpath" so that when debugging the right

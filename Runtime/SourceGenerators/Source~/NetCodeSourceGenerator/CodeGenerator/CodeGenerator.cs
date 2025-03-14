@@ -139,7 +139,7 @@ namespace Unity.NetCode.Generators
                         context.diagnostic.LogError($"Setting invalid hash on variantType {ss.VariantTypeName} to {ss.Hash}!");
 
                     var displayName = ss.DisplayName ?? ss.VariantTypeName;
-                    displayName = SmartTruncateDisplayName(displayName);
+                    displayName = SmartTruncateDisplayNameForFs64B(displayName);
 
                     var isDefaultSerializer = string.IsNullOrWhiteSpace(ss.VariantTypeName) || ss.VariantTypeName == ss.ComponentTypeName;
 
@@ -155,7 +155,7 @@ namespace Unity.NetCode.Generators
                     replacements["TYPE_IS_INPUT_BUFFER"] = typeInfo.ComponentType == ComponentType.CommandData ? "1" : "0";
                     replacements["TYPE_IS_TEST_VARIANT"] = typeInfo.IsTestVariant ? "1" : "0";
                     replacements["TYPE_HAS_DONT_SUPPORT_PREFAB_OVERRIDES_ATTRIBUTE"] = typeInfo.HasDontSupportPrefabOverridesAttribute ? "1" : "0";
-                    replacements["GHOST_PREFAB_TYPE"] = ss.GhostAttribute != null ? $"GhostPrefabType.{ss.GhostAttribute.PrefabType.ToString()}" : "GhostPrefabType.All";
+                    replacements["GHOST_PREFAB_TYPE"] = ss.GhostAttribute != null ? $"GhostPrefabType.{ss.GhostAttribute.PrefabType.ToString().Replace(",", "|GhostPrefabType.")}" : "GhostPrefabType.All";
 
                     if (typeInfo.GhostAttribute != null)
                     {
@@ -201,7 +201,7 @@ namespace Unity.NetCode.Generators
 
         /// <summary>Long display names like "Some.Very.Long.Namespace.WithAMassiveStructNameAtTheEnd" will be truncated from the back.
         /// E.g. Removing "Some", then "Very" etc. It must fit into the FixedString capacity, otherwise we'll get runtime exceptions during Registration.</summary>
-        static string SmartTruncateDisplayName(string displayName)
+        internal static string SmartTruncateDisplayNameForFs64B(string displayName)
         {
             int indexOf = 0;
             const int fixedString64BytesCapacity = 61;
@@ -370,6 +370,7 @@ namespace Unity.NetCode.Generators
             }
             // FieldTypeName includes the namespace, strip that away when generating the buffer type name
             bufferName = $"{typeTree.FieldTypeName}InputBufferData";
+
             if (typeTree.Namespace.Length != 0 && typeTree.FieldTypeName.Length > typeTree.Namespace.Length)
                 bufferName = $"{typeTree.FieldTypeName.Substring(typeTree.Namespace.Length + 1)}InputBufferData";
             // If the type is nested inside another class/type the parent name will be included in the type name separated by an underscore
@@ -378,7 +379,10 @@ namespace Unity.NetCode.Generators
             var typeBuilder = new TypeInformationBuilder(context.diagnostic, context.executionContext, TypeInformationBuilder.SerializationMode.Commands);
             // Parse input generated code as command data
             context.ResetState();
+            context.generatedFilePrefix += bufferName;
+            bufferName = context.generatorName + bufferName;
             context.generatorName = bufferName;
+
             bufferTypeTree = typeBuilder.BuildTypeInformation(bufferSymbol, null);
             if (bufferTypeTree == null)
             {
@@ -393,7 +397,7 @@ namespace Unity.NetCode.Generators
         private static void GenerateInputBufferGhostComponent(Context context, TypeInformation inputTypeTree, string bufferName, ITypeSymbol bufferSymbol)
         {
             // Add to generatedType list so it is included in the serializer registration system
-            context.generatedTypes.Add(bufferName);
+            context.generatedTypes.Add($"global::{context.generatedNs}.{bufferName}");
 
             var ghostFieldOverride = new GhostField();
             // Type information needs to be rebuilt and this time interpreting the type as a component instead of command
@@ -501,6 +505,8 @@ namespace Unity.NetCode.Generators
                     //parent class does not aggregate field.
                     if (!parentContainer.TypeInformation.Attribute.aggregateChangeMask)
                     {
+                        parentContainer.m_TargetGenerator.AppendFragment("GHOST_AGGREGATE_WRITE", parentContainer.m_TargetGenerator, "GHOST_WRITE_COMBINED");
+                        parentContainer.m_TargetGenerator.Fragments["__GHOST_AGGREGATE_WRITE__"].Content = "";
                         ++context.changeMaskBitCount;
                         ++context.curChangeMaskBits;
                     }
@@ -511,6 +517,8 @@ namespace Unity.NetCode.Generators
                 generator.AppendTarget(parentContainer);
                 if (!parentContainer.TypeInformation.Attribute.aggregateChangeMask)
                 {
+                    parentContainer.m_TargetGenerator.AppendFragment("GHOST_AGGREGATE_WRITE", parentContainer.m_TargetGenerator, "GHOST_WRITE_COMBINED");
+                    parentContainer.m_TargetGenerator.Fragments["__GHOST_AGGREGATE_WRITE__"].Content = "";
                     ++context.changeMaskBitCount;
                     ++context.curChangeMaskBits;
                 }
@@ -543,6 +551,8 @@ namespace Unity.NetCode.Generators
             //increment the mask bits if the current aggregation scope is completed.
             if (type.Attribute.aggregateChangeMask && !parentContainer.TypeInformation.Attribute.aggregateChangeMask)
             {
+                parentContainer.m_TargetGenerator.AppendFragment("GHOST_AGGREGATE_WRITE", parentContainer.m_TargetGenerator, "GHOST_WRITE_COMBINED");
+                parentContainer.m_TargetGenerator.Fragments["__GHOST_AGGREGATE_WRITE__"].Content = "";
                 ++context.curChangeMaskBits;
                 ++context.changeMaskBitCount;
             }
@@ -552,7 +562,7 @@ namespace Unity.NetCode.Generators
         public struct GeneratedFile
         {
             public string Namespace;
-            public string GeneratedClassName;
+            public string GeneratedFileName;
             public string Code;
         }
 
@@ -608,7 +618,7 @@ namespace Unity.NetCode.Generators
         public class Context
         {
             internal GeneratorExecutionContext executionContext;
-            public readonly string generatedNs;
+            public string generatedNs;
             public readonly TypeRegistry registry;
             public readonly IDiagnosticReporter diagnostic;
             public readonly CodeGenCache codeGenCache;
@@ -634,6 +644,7 @@ namespace Unity.NetCode.Generators
             public string variantTypeFullName;
             public ulong variantHash;
             public string generatorName;
+            public string generatedFilePrefix;
             //Total number of changeMaskBits bits
             public int changeMaskBitCount;
             //The current used mask bits
@@ -658,7 +669,7 @@ namespace Unity.NetCode.Generators
 
             string GenerateNamespaceFromAssemblyName(string assemblyName)
             {
-                return Regex.Replace(assemblyName, @"[^\w\.]", "_", RegexOptions.Singleline) + ".Generated";
+                return $"{Regex.Replace(assemblyName, @"[^\w\.]", "_", RegexOptions.Singleline)}.Generated";
             }
 
             public Context(TypeRegistry typeRegistry, ITemplateFileProvider templateFileProvider,

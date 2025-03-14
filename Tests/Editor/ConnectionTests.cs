@@ -1,3 +1,5 @@
+using System;
+using System.Linq;
 using System.Text.RegularExpressions;
 using NUnit.Framework;
 using Unity.Collections;
@@ -7,7 +9,7 @@ using Unity.Networking.Transport;
 using Unity.Transforms;
 using UnityEngine;
 using UnityEngine.TestTools;
-
+using State = Unity.NetCode.ConnectionState.State;
 namespace Unity.NetCode.Tests
 {
     [DisableAutoCreation]
@@ -32,6 +34,11 @@ namespace Unity.NetCode.Tests
     }
     public class ConnectionTests
     {
+        public struct CheckApproval : IApprovalRpcCommand
+        {
+            public int Payload;
+        }
+
         [Test]
         public void ConnectSingleClient()
         {
@@ -46,14 +53,14 @@ namespace Unity.NetCode.Tests
                 testWorld.GetSingletonRW<NetworkStreamDriver>(testWorld.ClientWorlds[0]).ValueRW.Connect(testWorld.ClientWorlds[0].EntityManager, ep);
 
                 for (int i = 0; i < 16; ++i)
-                    testWorld.Tick(16f/1000f);
+                    testWorld.Tick();
 
                 Assert.AreEqual(1, testWorld.ServerWorld.GetExistingSystemManaged<CheckConnectionSystem>().numConnected);
                 Assert.AreEqual(1, testWorld.ClientWorlds[0].GetExistingSystemManaged<CheckConnectionSystem>().numConnected);
 
                 testWorld.GoInGame();
                 for (int i = 0; i < 16; ++i)
-                    testWorld.Tick(16f/1000f);
+                    testWorld.Tick();
 
                 Assert.AreEqual(1, testWorld.ServerWorld.GetExistingSystemManaged<CheckConnectionSystem>().numConnected);
                 Assert.AreEqual(1, testWorld.ServerWorld.GetExistingSystemManaged<CheckConnectionSystem>().numInGame);
@@ -73,6 +80,7 @@ namespace Unity.NetCode.Tests
                 SimulationTickRate = simulationTickRate,
                 PredictedFixedStepSimulationTickRatio = predictedFixedStepRatio,
                 NetworkTickRate = networkTickRate,
+                HandshakeApprovalTimeoutMS = 10_000, // Prevent timeout.
             };
             SetupTickRate(tickRate, testWorld);
             //Check that the predicted fixed step rate is also set accordingly.
@@ -89,8 +97,7 @@ namespace Unity.NetCode.Tests
             tickRate.ResolveDefaults();
             tickRate.Validate();
             // Connect and make sure the connection could be established
-            const float frameTime = 1f / 60f;
-            testWorld.Connect(frameTime);
+            testWorld.Connect();
 
             //Check that the simulation tick rate are the same
             var serverRate = testWorld.GetSingleton<ClientServerTickRate>(testWorld.ServerWorld);
@@ -101,10 +108,327 @@ namespace Unity.NetCode.Tests
             Assert.AreEqual(tickRate.PredictedFixedStepSimulationTickRatio, clientRate.PredictedFixedStepSimulationTickRatio);
 
             //Do one last step so all the new settings are applied
-            testWorld.Tick(frameTime);
+            testWorld.Tick();
+        }
+
+        [Test]
+        public void IncorrectlyDisposingAConnectionLogsError()
+        {
+            using (var testWorld = new NetCodeTestWorld())
+            {
+                testWorld.Bootstrap(true);
+                testWorld.CreateWorlds(true, 1);
+                Test(testWorld, testWorld.ClientWorlds[0]);
+            }
+            using (var testWorld = new NetCodeTestWorld())
+            {
+                testWorld.Bootstrap(true);
+                testWorld.CreateWorlds(true, 1);
+                Test(testWorld, testWorld.ServerWorld);
+            }
+
+            static void Test(NetCodeTestWorld testWorld, World worldBeingTested)
+            {
+                testWorld.Connect();
+                var connEntity = testWorld.TryGetSingletonEntity<NetworkStreamConnection>(worldBeingTested);
+                Assert.IsTrue(worldBeingTested.EntityManager.Exists(connEntity));
+                LogAssert.Expect(LogType.Error, new Regex($@"(has been incorrectly disposed)(.*)({worldBeingTested.Name})"));
+                worldBeingTested.EntityManager.DestroyEntity(connEntity);
+                testWorld.Tick(); // This tick will raise the error.
+                testWorld.Tick(); // This tick should NOT raise it again.
+            }
+        }
+
+        public enum ApprovalMode
+        {
+            NoApproval,
+            WithApproval,
+        }
+        public enum ConnectionStateMode
+        {
+            UsingConnectionState,
+            NoConnectionState,
+        }
+
+        private bool isVerifyingConnState;
+        [Test]
+        public void ConnectionEventsAreRaised([Values]ApprovalMode approvalMode, [Values]ConnectionStateMode connectionStateMode)
+        {
+            var isApproval = approvalMode == ApprovalMode.WithApproval;
+            isVerifyingConnState = connectionStateMode == ConnectionStateMode.UsingConnectionState;
+            using (var testWorld = new NetCodeTestWorld())
+            {
+                testWorld.Bootstrap(true);
+                testWorld.CreateWorlds(true, 3);
+
+                // Manually connect them:
+                var ep = NetworkEndpoint.LoopbackIpv4;
+                ep.Port = 7979;
+
+                testWorld.GetSingletonRW<NetworkStreamDriver>(testWorld.ServerWorld).ValueRW.RequireConnectionApproval = isApproval;
+                testWorld.GetSingletonRW<NetworkStreamDriver>(testWorld.ServerWorld).ValueRW.Listen(ep);
+                var connectionEntities = new Entity[testWorld.ClientWorlds.Length];
+                for (int i = 0; i < testWorld.ClientWorlds.Length; ++i)
+                {
+                    var clientWorld = testWorld.ClientWorlds[i];
+                    if (isVerifyingConnState)
+                    {
+                        connectionEntities[i] = clientWorld.EntityManager.CreateEntity(typeof(ConnectionState));
+                        testWorld.GetSingletonRW<NetworkStreamDriver>(clientWorld).ValueRW.Connect(clientWorld.EntityManager, ep, connectionEntities[i]);
+                        // Ensure the ConnectionState is correct even on tick zero.
+                        var cs = clientWorld.EntityManager.GetComponentData<ConnectionState>(connectionEntities[i]);
+                        Assert.AreEqual(State.Connecting, cs.CurrentState);
+                    }
+                    else connectionEntities[i] = testWorld.GetSingletonRW<NetworkStreamDriver>(clientWorld).ValueRW.Connect(clientWorld.EntityManager, ep);
+                }
+
+                // Tick zero: Connect called! No events at all.
+                AssertCorrectEventCount(testWorld, 0, testWorld.ServerWorld);
+                AssertCorrectEventCount(testWorld, 0, testWorld.ClientWorlds);
+
+                // Tick one: Client connecting events only:
+                testWorld.Tick();
+                AssertCorrectEventCount(testWorld, 0, testWorld.ServerWorld);
+                AssertCorrectEventCount(testWorld, 1, testWorld.ClientWorlds);
+                WorldHasEventAtIndex(testWorld, testWorld.ClientWorlds, 0, ConnectionState.State.Connecting);
+
+                // Tick 2: Both the client and server should now get the handshake:
+                testWorld.Tick();
+                AssertCorrectEventCount(testWorld, 3, testWorld.ServerWorld);
+                AssertCorrectEventCount(testWorld, 1, testWorld.ClientWorlds);
+
+                // Add connection states now:
+                if (isVerifyingConnState)
+                {
+                    using var serverNetworkStreamConnectionsQuery = testWorld.ServerWorld.EntityManager.CreateEntityQuery(ComponentType.ReadOnly<NetworkStreamConnection>());
+                    Assert.AreEqual(3, serverNetworkStreamConnectionsQuery.CalculateEntityCount(), "Sanity check: Adding ConnectionState to all 3 server entities.");
+                    testWorld.ServerWorld.EntityManager.AddComponent<ConnectionState>(serverNetworkStreamConnectionsQuery);
+                }
+
+                isVerifyingConnState = false; // ConnectionState is added THIS FRAME on the server, so won't be correct here!
+                ServerHasEventForEachClient(testWorld, ConnectionState.State.Handshake);
+                isVerifyingConnState = connectionStateMode == ConnectionStateMode.UsingConnectionState;
+                WorldHasEventAtIndex(testWorld, testWorld.ClientWorlds, 0, ConnectionState.State.Handshake);
+
+                // Tick 3: Client is sending the RPC to the server, no events on either.
+                testWorld.Tick();
+                AssertCorrectEventCount(testWorld, 0, testWorld.ServerWorld);
+                AssertCorrectEventCount(testWorld, 0, testWorld.ClientWorlds);
+
+                // Tick 4: This is where the flow diverges:
+                // - With approval flow - We enter `Approval` state on server and reply.
+                // - Without approval flow - We enter Connected` state on the server and reply.
+                // In both cases: The server should have events, but not client!
+                testWorld.Tick();
+                AssertCorrectEventCount(testWorld, 3, testWorld.ServerWorld);
+                AssertCorrectEventCount(testWorld, 0, testWorld.ClientWorlds);
+
+                if (isApproval) // DIVERGE!
+                {
+                    using var serverCheckApprovalQuery = testWorld.ServerWorld.EntityManager.CreateEntityQuery(ComponentType.ReadOnly<ReceiveRpcCommandRequest>(), ComponentType.ReadOnly<CheckApproval>());
+                    Assert.AreEqual(0, serverCheckApprovalQuery.CalculateEntityCount());
+
+                    // Server should have Approval state.
+                    ServerHasEventForEachClient(testWorld, ConnectionState.State.Approval);
+
+                    // Client must wait for `ServerRequestApprovalAfterHandshake` RPC.
+                    // Tick 5: Clients now move into Approval!
+                    testWorld.Tick();
+                    Assert.AreEqual(0, serverCheckApprovalQuery.CalculateEntityCount());
+                    AssertCorrectEventCount(testWorld, 0, testWorld.ServerWorld);
+                    AssertCorrectEventCount(testWorld, 1, testWorld.ClientWorlds);
+                    WorldHasEventAtIndex(testWorld, testWorld.ClientWorlds, 0, ConnectionState.State.Approval);
+
+                    // Connection approval routine runs - Clients user-code now reacts to this event and send an approval RPC...
+                    for (var i = 0; i < testWorld.ClientWorlds.Length; i++)
+                    {
+                        var world = testWorld.ClientWorlds[i];
+                        var approvalRpc = world.EntityManager.CreateEntity();
+                        world.EntityManager.AddComponentData(approvalRpc, new CheckApproval() {Payload = 1234});
+                        world.EntityManager.AddComponent<SendRpcCommandRequest>(approvalRpc);
+                    }
+
+                    // Tick 6: Approval RPC in flight...
+                    testWorld.Tick();
+                    Assert.AreEqual(0, serverCheckApprovalQuery.CalculateEntityCount());
+                    AssertCorrectEventCount(testWorld, 0, testWorld.ServerWorld);
+                    AssertCorrectEventCount(testWorld, 0, testWorld.ClientWorlds);
+
+                    // Tick 7: Approval RPC arrives, RPC Entity spawn is queued...
+                    testWorld.Tick();
+                    Assert.AreEqual(0, serverCheckApprovalQuery.CalculateEntityCount());
+                    AssertCorrectEventCount(testWorld, 0, testWorld.ServerWorld);
+                    AssertCorrectEventCount(testWorld, 0, testWorld.ClientWorlds);
+
+                    // Tick 8: Approval RPC is queryable! Server processes it:
+                    testWorld.Tick();
+                    AssertCorrectEventCount(testWorld, 0, testWorld.ServerWorld);
+                    AssertCorrectEventCount(testWorld, 0, testWorld.ClientWorlds);
+
+                    // Servers user-code now reacts, adding the `ConnectionApproved`...
+                    var rpcEntities = serverCheckApprovalQuery.ToEntityArray(Allocator.Temp);
+                    var rpcData = serverCheckApprovalQuery.ToComponentDataArray<ReceiveRpcCommandRequest>(Allocator.Temp);
+                    Assert.AreEqual(3, rpcEntities.Length, "Server expecting to have 3 CheckApproval RPCs from clients!");
+                    var approvalData = serverCheckApprovalQuery.ToComponentDataArray<CheckApproval>(Allocator.Temp);
+                    for (var i = 0; i < rpcData.Length; i++)
+                    {
+                        Assert.AreEqual(1234, approvalData[i].Payload);
+                        testWorld.ServerWorld.EntityManager.DestroyEntity(rpcEntities[i]);
+                        testWorld.ServerWorld.EntityManager.AddComponent<ConnectionApproved>(rpcData[i].SourceConnection);
+                    }
+
+                    // Tick 9: Now the new approval component will be registered by the server,
+                    // leading to server connect, realigning the two flows...
+                    testWorld.Tick();
+                    Assert.AreEqual(0, serverCheckApprovalQuery.CalculateEntityCount());
+                }
+
+                // Server - Connected:
+                AssertCorrectEventCount(testWorld, 3, testWorld.ServerWorld);
+                AssertCorrectEventCount(testWorld, 0, testWorld.ClientWorlds);
+                ServerHasEventForEachClient(testWorld, ConnectionState.State.Connected, true);
+
+                // Next tick: The client should ALSO now receive the `Connected` state:
+                testWorld.Tick();
+                AssertCorrectEventCount(testWorld, 0, testWorld.ServerWorld);
+                AssertCorrectEventCount(testWorld, 1, testWorld.ClientWorlds);
+                WorldHasEventAtIndex(testWorld, testWorld.ClientWorlds, 0, ConnectionState.State.Connected, true);
+
+                // Then we expect quiet thereafter...
+                for (int i = 0; i < 3; i++)
+                {
+                    testWorld.Tick();
+                    AssertCorrectEventCount(testWorld, 0, testWorld.ServerWorld);
+                    AssertCorrectEventCount(testWorld, 0, testWorld.ClientWorlds);
+                }
+
+                Debug.Log("Connection flow success! ----------------------");
+
+                using var serverNetworkIdQuery = testWorld.ServerWorld.EntityManager.CreateEntityQuery(ComponentType.ReadOnly<NetworkId>());
+                var lastClientsConnectionEntity = serverNetworkIdQuery.ToEntityArray(Allocator.Temp)[^1];
+                var lastClientWorld = testWorld.ClientWorlds[^1];
+                var otherClients = testWorld.ClientWorlds.AsSpan(0, testWorld.ClientWorlds.Length - 1).ToArray();
+
+                // Disconnect the last client, but do it via a server kick, so that we can also test the disconnect reason:
+                {
+                    var conn = testWorld.ServerWorld.EntityManager.GetComponentData<NetworkStreamConnection>(lastClientsConnectionEntity);
+                    testWorld.GetSingletonRW<NetworkStreamDriver>(testWorld.ServerWorld).ValueRW.DriverStore.Disconnect(conn);
+                }
+
+                // Next Tick: Disconnect is applied, event is raised later on the same frame (NetworkGroupCommandBufferSystem)
+                // for BOTH server and client.
+                testWorld.Tick();
+                AssertCorrectEventCount(testWorld, 1, testWorld.ServerWorld);
+                WorldHasEventAtIndex(testWorld, testWorld.ServerWorld, 0, ConnectionState.State.Disconnected, true, NetworkStreamDisconnectReason.ConnectionClose);
+                AssertCorrectEventCount(testWorld, 0, otherClients);
+                AssertCorrectEventCount(testWorld, 1, lastClientWorld);
+                WorldHasEventAtIndex(testWorld, lastClientWorld, 0, ConnectionState.State.Disconnected, true, NetworkStreamDisconnectReason.ClosedByRemote);
+
+                // Now tick for a few more frames, ensuring there are no errant events:
+                for (int i = 0; i < 3; i++)
+                {
+                    testWorld.Tick();
+                    AssertCorrectEventCount(testWorld, 0, testWorld.ServerWorld);
+                    AssertCorrectEventCount(testWorld, 0, otherClients);
+                    AssertCorrectEventCount(testWorld, 0, lastClientWorld);
+                }
+            }
+        }
+
+        private static void AssertCorrectEventCount(NetCodeTestWorld testWorld, int numEventsExpectedPerWorld, params World[] worlds)
+        {
+            foreach (var world in worlds)
+            {
+                world.EntityManager.CompleteAllTrackedJobs();
+                var connectionEventsForTick = testWorld.GetSingleton<NetworkStreamDriver>(world).ConnectionEventsForTick;
+                if (numEventsExpectedPerWorld == connectionEventsForTick.Length) continue;
+
+                string all = "";
+                for (var i = 0; i < connectionEventsForTick.Length; i++)
+                {
+                    var evt = connectionEventsForTick[i];
+                    all += $"\n\t[{i}]={evt.ToFixedString()}";
+                    if (i < numEventsExpectedPerWorld) all += " <-- Expected!";
+                    else all += " <-- Surprising!";
+                }
+
+                if (connectionEventsForTick.Length > numEventsExpectedPerWorld)
+                    Assert.Fail($"Rogue events found! {world.Name} has too MANY events on tick {NetCodeTestWorld.TickIndex}! Expected: {numEventsExpectedPerWorld}, but has: {connectionEventsForTick.Length}\n{all}");
+                else Assert.Fail($"{world.Name} has too FEW events on tick {NetCodeTestWorld.TickIndex}! Expected: {numEventsExpectedPerWorld}, but has: {connectionEventsForTick.Length}\n{all}");
+            }
+        }
+
+        private void ServerHasEventForEachClient(NetCodeTestWorld testWorld, ConnectionState.State expectedState, bool expectedValidNetworkId = false, NetworkStreamDisconnectReason expectedDisconnectReason = default)
+        {
+            var serverWorld = testWorld.ServerWorld;
+            serverWorld.EntityManager.CompleteAllTrackedJobs();
+            var connectionEventsForServerWorld = testWorld.GetSingleton<NetworkStreamDriver>(serverWorld).ConnectionEventsForTick;
+            for (var i = 0; i < connectionEventsForServerWorld.Length; i++)
+            {
+                WorldHasEventAtIndex(testWorld, serverWorld, i, expectedState, expectedValidNetworkId, expectedDisconnectReason);
+            }
+        }
+
+        private void WorldHasEventAtIndex(NetCodeTestWorld testWorld, World[] worlds, int index, ConnectionState.State expectedState, bool expectedValidNetworkId = false, NetworkStreamDisconnectReason expectedDisconnectReason = default)
+        {
+            foreach (var world in worlds)
+                WorldHasEventAtIndex(testWorld, world, index, expectedState, expectedValidNetworkId, expectedDisconnectReason);
+        }
+
+        private void WorldHasEventAtIndex(NetCodeTestWorld testWorld, World world, int index, ConnectionState.State expectedState, bool expectedValidNetworkId = false, NetworkStreamDisconnectReason expectedDisconnectReason = default)
+        {
+            world.EntityManager.CompleteAllTrackedJobs();
+            bool expectEntityExists = expectedState != ConnectionState.State.Disconnected;
+            bool expectedConnectionIdToBeValid = expectedState is State.Connecting or State.Handshake or State.Approval or State.Connected or State.Disconnected;
+            var connectionEvents = testWorld.GetSingleton<NetworkStreamDriver>(world).ConnectionEventsForTick;
+            var evt = connectionEvents[index];
+            var s = $"[{world.Name}] ConnectionEventsForTick[{index}]={evt.ToFixedString()}\nOn tick {NetCodeTestWorld.TickIndex}\nExpecting: {expectedState}, validNetworkId:{expectedValidNetworkId}";
+            Assert.AreEqual(expectedConnectionIdToBeValid, evt.ConnectionId.IsCreated, s + "\nevt.ConnectionId.IsCreated?");
+            Assert.AreEqual(expectedState, evt.State, s + "\nevt.State is correct?");
+
+            Assert.AreEqual(expectedDisconnectReason, evt.DisconnectReason, s + "\nevt.DisconnectReason correct?");
+            if (expectedValidNetworkId)
+            {
+                if (expectEntityExists)
+                {
+                    Assert.IsTrue(world.EntityManager.HasComponent<NetworkId>(evt.ConnectionEntity), s + "\nHasComponent<NetworkId>(evt.ConnectionEntity) == TRUE");
+                    var expectedNetworkId = world.EntityManager.GetComponentData<NetworkId>(evt.ConnectionEntity);
+                    Assert.AreEqual(expectedNetworkId.Value, evt.Id.Value, s + "\nComponent value == evt.NetworkId?");
+                }
+                else Assert.AreNotEqual(0, evt.Id.Value, s + "\nevt.NetworkId.Value != 0?");
+            }
+            else if (expectEntityExists)
+            {
+                Assert.IsFalse(world.EntityManager.HasComponent<NetworkId>(evt.ConnectionEntity), s + "\nHasComponent<NetworkId>(evt.ConnectionEntity) == FALSE");
+            }
+
+            if (expectEntityExists)
+                Assert.AreEqual(expectedState, world.EntityManager.GetComponentData<NetworkStreamConnection>(evt.ConnectionEntity).CurrentState, s + "\nNetworkStreamConnection.CurrentState == " + expectedState);
+
+            if (isVerifyingConnState)
+            {
+                var cs = world.EntityManager.GetComponentData<ConnectionState>(evt.ConnectionEntity);
+                Assert.AreEqual(expectedState, cs.CurrentState, s + "\nConnectionState.CurrentState correct?");
+                Assert.AreEqual(expectedDisconnectReason, cs.DisconnectReason, s + "\nConnectionState.DisconnectReason correct?");
+                if (expectedValidNetworkId && expectEntityExists)
+                {
+                    var expectedNetworkId = world.EntityManager.GetComponentData<NetworkId>(evt.ConnectionEntity);
+                    Assert.AreEqual(expectedNetworkId.Value, cs.NetworkId, s + "\nConnectionState.NetworkId == evt.NetworkId?");
+                }
+                if (expectedState == State.Disconnected)
+                {
+                    bool didRemove = world.EntityManager.RemoveComponent<ConnectionState>(evt.ConnectionEntity);
+                    Assert.IsTrue(didRemove, s + "\nRemove ConnectionState success?");
+                }
+            }
+
+            Assert.AreEqual(expectEntityExists, world.EntityManager.Exists(evt.ConnectionEntity), s + "\nevt.ConnectionEntity exists?");
         }
     }
 
+    // Without NETCODE_DEBUG, ALL error logs are logged to the console, thus we cannot turn on specific ones to test against.
+    // Hard to fix the tests to correctly expect, so simply disabled all of them.
+#if !NETCODE_NDEBUG
     public class VersionTests
     {
         [Test]
@@ -139,103 +463,89 @@ namespace Unity.NetCode.Tests
                 testWorld.GetSingletonRW<NetworkStreamDriver>(testWorld.ClientWorlds[0]).ValueRW.Connect(testWorld.ClientWorlds[0].EntityManager, ep);
 
                 for (int i = 0; i < 16; ++i)
-                    testWorld.Tick(16f/1000f);
+                    testWorld.Tick();
 
                 using var query = testWorld.ClientWorlds[0].EntityManager.CreateEntityQuery(ComponentType.ReadOnly<NetworkStreamConnection>());
                 Assert.AreEqual(1, query.CalculateEntityCount());
             }
         }
 
+        public enum DifferenceType
+        {
+            GameVersion,
+            NetCodeVersion,
+            RpcVersion,
+            ComponentVersion,
+        }
         [Test]
-        public void DifferentVersions_AreDisconnnected()
+        public void DifferentVersions_AreDisconnnected([Values]DifferenceType differenceType)
         {
             using (var testWorld = new NetCodeTestWorld())
             {
                 testWorld.Bootstrap(true);
-                //Don't tick the world after creation. that will generate the default protocol version.
-                //We want to use a custom one here
-                testWorld.CreateWorlds(true, 1, false);
-                var serverVersion = testWorld.ServerWorld.EntityManager.CreateEntity(typeof(NetworkProtocolVersion));
-                testWorld.ServerWorld.EntityManager.SetComponentData(serverVersion, new NetworkProtocolVersion
-                {
-                    NetCodeVersion = 1,
-                    GameVersion = 0,
-                    RpcCollectionVersion = 1,
-                    ComponentCollectionVersion = 1
-                });
-                var ep = NetworkEndpoint.LoopbackIpv4;
-                ep.Port = 7979;
-                testWorld.GetSingletonRW<NetworkStreamDriver>(testWorld.ServerWorld).ValueRW.Listen(ep);
+                testWorld.CreateWorlds(true, 1, true);
 
-                //Different NetCodeVersion
-                var clientVersion = testWorld.ClientWorlds[0].EntityManager.CreateEntity(typeof(NetworkProtocolVersion));
-                using var query = testWorld.ClientWorlds[0].EntityManager.CreateEntityQuery(ComponentType.ReadOnly<NetworkStreamConnection>());
-                testWorld.ClientWorlds[0].EntityManager.SetComponentData(clientVersion, new NetworkProtocolVersion
+                // Setup `RequireStrictProtocolVersionValidation`:
+                var clientServerTickRate = new ClientServerTickRate();
+                clientServerTickRate.ResolveDefaults();
+                testWorld.ServerWorld.EntityManager.CreateSingleton(clientServerTickRate);
+
+                // Get the default protocol version:
+                int maxTicks = 3;
+                Entity serverProtocolVersionEntity;
+                while ((serverProtocolVersionEntity = testWorld.TryGetSingletonEntity<NetworkProtocolVersion>(testWorld.ServerWorld)) == Entity.Null)
                 {
-                    NetCodeVersion = 2,
-                    GameVersion = 0,
-                    RpcCollectionVersion = 1,
-                    ComponentCollectionVersion = 1
-                });
-                testWorld.GetSingletonRW<NetworkStreamDriver>(testWorld.ClientWorlds[0]).ValueRW.Connect(testWorld.ClientWorlds[0].EntityManager, ep);
+                    testWorld.Tick();
+                    if(maxTicks-- <= 0) Assert.Fail("Sanity: Expected singleton creation!");
+                }
+                // Modify it on server:
+                var serverProtocolVersion = testWorld.ServerWorld.EntityManager.GetComponentData<NetworkProtocolVersion>(serverProtocolVersionEntity);
+                switch (differenceType)
+                {
+                    case DifferenceType.GameVersion:
+                        serverProtocolVersion.GameVersion = 99;
+                        break;
+                    case DifferenceType.NetCodeVersion:
+                        serverProtocolVersion.NetCodeVersion = 98;
+                        break;
+                    case DifferenceType.RpcVersion:
+                        serverProtocolVersion.RpcCollectionVersion = 97;
+                        break;
+                    case DifferenceType.ComponentVersion:
+                        serverProtocolVersion.ComponentCollectionVersion = 96;
+                        break;
+                    default: throw new ArgumentOutOfRangeException(nameof(differenceType), differenceType, null);
+                }
+                testWorld.ServerWorld.EntityManager.SetComponentData(serverProtocolVersionEntity, serverProtocolVersion);
 
                 // The ordering of the protocol version error messages can be scrambled, so we can't log.expect exact ordering
                 LogAssert.ignoreFailingMessages = true;
-                LogAssert.Expect(LogType.Error, new Regex("\\[(.*)\\] RpcSystem received bad protocol version from NetworkConnection\\[id0,v\\d\\]"));
-                LogAssert.Expect(LogType.Error, new Regex("\\[(.*)\\] RpcSystem received bad protocol version from NetworkConnection\\[id0,v\\d\\]"));
-                for (int i = 0; i < 16; ++i)
-                    testWorld.Tick(16f/1000f);
+                LogAssert.Expect(LogType.Error, new Regex(@"\[ClientTest(.*)\] RpcSystem received bad protocol version from NetworkConnection"));
+                LogAssert.Expect(LogType.Error, new Regex(@"\[ServerTest(.*)\] RpcSystem received bad protocol version from NetworkConnection"));
 
-                Assert.AreEqual(0, query.CalculateEntityCount());
-                //Different GameVersion
-                testWorld.ClientWorlds[0].EntityManager.SetComponentData(clientVersion, new NetworkProtocolVersion
+                switch (differenceType)
                 {
-                    NetCodeVersion = 1,
-                    GameVersion = 1,
-                    RpcCollectionVersion = 1,
-                    ComponentCollectionVersion = 1
-                });
-                testWorld.GetSingletonRW<NetworkStreamDriver>(testWorld.ClientWorlds[0]).ValueRW.Connect(testWorld.ClientWorlds[0].EntityManager, ep);
+                    case DifferenceType.GameVersion:
+                        LogAssert.Expect(LogType.Error, "The Game version mismatched between remote and local. Ensure that you are using the same version of the game on both client and server.");
+                        break;
+                    case DifferenceType.NetCodeVersion:
+                        LogAssert.Expect(LogType.Error, "The NetCode version mismatched between remote and local. Ensure that you are using the same version of Netcode for Entities on both client and server.");
+                        break;
+                    case DifferenceType.RpcVersion:
+                        LogAssert.Expect(LogType.Error, "The RPC Collection mismatched between remote and local. Compare the following list of RPCs against the set produced by the remote, to find which RPCs are misaligned. You can also enable `RpcCollection.DynamicAssemblyList` to relax this requirement (which is recommended during development, see documentation for more details).");
+                        break;
+                    case DifferenceType.ComponentVersion:
+                        LogAssert.Expect(LogType.Error, "The Component Collection mismatched between remote and local. Compare the following list of Components against the set produced by the remote, to find which components are misaligned. You can also enable `RpcCollection.DynamicAssemblyList` to relax this requirement (which is recommended during development, see documentation for more details).");
+                        break;
+                    default:
+                        throw new ArgumentOutOfRangeException(nameof(differenceType), differenceType, null);
+                }
 
-                LogAssert.Expect(LogType.Error, new Regex("\\[(.*)\\] RpcSystem received bad protocol version from NetworkConnection\\[id0,v\\d\\]"));
-                LogAssert.Expect(LogType.Error, new Regex("\\[(.*)\\] RpcSystem received bad protocol version from NetworkConnection\\[id0,v\\d\\]"));
-                for (int i = 0; i < 16; ++i)
-                    testWorld.Tick(16f/1000f);
+                // Connecting triggers the error, as it occurs during handshake.
+                testWorld.Connect(failTestIfConnectionFails: false);
 
-                Assert.AreEqual(0, query.CalculateEntityCount());
-                //Different Rpcs
-                testWorld.ClientWorlds[0].EntityManager.SetComponentData(clientVersion, new NetworkProtocolVersion
-                {
-                    NetCodeVersion = 1,
-                    GameVersion = 0,
-                    RpcCollectionVersion = 2,
-                    ComponentCollectionVersion = 1
-                });
-                testWorld.GetSingletonRW<NetworkStreamDriver>(testWorld.ClientWorlds[0]).ValueRW.Connect(testWorld.ClientWorlds[0].EntityManager, ep);
-
-                LogAssert.Expect(LogType.Error, new Regex("\\[(.*)\\] RpcSystem received bad protocol version from NetworkConnection\\[id0,v\\d\\]"));
-                LogAssert.Expect(LogType.Error, new Regex("\\[(.*)\\] RpcSystem received bad protocol version from NetworkConnection\\[id0,v\\d\\]"));
-                for (int i = 0; i < 16; ++i)
-                    testWorld.Tick(16f/1000f);
-
-                Assert.AreEqual(0, query.CalculateEntityCount());
-
-                //Different Ghost
-                testWorld.ClientWorlds[0].EntityManager.SetComponentData(clientVersion, new NetworkProtocolVersion
-                {
-                    NetCodeVersion = 1,
-                    GameVersion = 0,
-                    RpcCollectionVersion = 1,
-                    ComponentCollectionVersion = 2
-                });
-                testWorld.GetSingletonRW<NetworkStreamDriver>(testWorld.ClientWorlds[0]).ValueRW.Connect(testWorld.ClientWorlds[0].EntityManager, ep);
-
-                LogAssert.Expect(LogType.Error, new Regex("\\[(.*)\\] RpcSystem received bad protocol version from NetworkConnection\\[id0,v\\d\\]"));
-                LogAssert.Expect(LogType.Error, new Regex("\\[(.*)\\] RpcSystem received bad protocol version from NetworkConnection\\[id0,v\\d\\]"));
-                for (int i = 0; i < 16; ++i)
-                    testWorld.Tick(16f/1000f);
-
-                Assert.AreEqual(0, query.CalculateEntityCount());
+                Assert.AreEqual(Entity.Null, testWorld.TryGetSingletonEntity<NetworkStreamConnection>(testWorld.ServerWorld), "Expected no connection left!");
+                Assert.AreEqual(Entity.Null, testWorld.TryGetSingletonEntity<NetworkStreamConnection>(testWorld.ClientWorlds[0]), "Expected no connection left!");
             }
         }
 
@@ -248,7 +558,7 @@ namespace Unity.NetCode.Tests
             {
                 // Only print the protocol version debug errors in one world, so the output can be deterministically validated
                 // if it's printed in both worlds (client and server) the output can interweave and log checks will fail
-                testWorld.EnableLogsOnServer = debugServer;
+                testWorld.EnableLogsOnServer = debugServer;  // WARNING: DISABLE "Force Log Settings" TOOL OR THIS TEST WILL FAIL!
                 testWorld.EnableLogsOnClients = !debugServer;
                 testWorld.Bootstrap(true);
                 testWorld.CreateWorlds(true, 1, false);
@@ -264,12 +574,11 @@ namespace Unity.NetCode.Tests
                 testWorld.GetSingletonRW<NetworkStreamDriver>(testWorld.ServerWorld).ValueRW.Listen(ep);
                 testWorld.GetSingletonRW<NetworkStreamDriver>(testWorld.ClientWorlds[0]).ValueRW.Connect(testWorld.ClientWorlds[0].EntityManager, ep);
 
-                // This error obviously logs twice, so expecting only once doesn't work.
                 LogExpectProtocolError(testWorld, testWorld.ServerWorld, debugServer);
 
                 // Allow disconnect to happen
                 for (int i = 0; i < 16; ++i)
-                    testWorld.Tick(16f/1000f);
+                    testWorld.Tick();
 
                 // Verify client connection is disconnected
                 using var query = testWorld.ClientWorlds[0].EntityManager.CreateEntityQuery(ComponentType.ReadOnly<NetworkStreamConnection>());
@@ -278,29 +587,25 @@ namespace Unity.NetCode.Tests
         }
 
         [Test]
-        [TestCase(true)]
-        [TestCase(false)]
-        public void DisconnectEventAndRPCVersionErrorProcessedInSameFrame(bool checkServer)
+        public void DisconnectEventAndRPCVersionErrorProcessedInSameFrame([Values] bool checkServer)
         {
             using (var testWorld = new NetCodeTestWorld())
             {
                 // Only print the protocol version debug errors in one world, so the output can be deterministically validated
                 // if it's printed in both worlds (client and server) the output can interweave and log checks will fail
-                testWorld.EnableLogsOnServer = checkServer;
+                testWorld.EnableLogsOnServer = checkServer; // WARNING: DISABLE "Force Log Settings" TOOL OR THIS TEST WILL FAIL!
                 testWorld.EnableLogsOnClients = !checkServer;
                 testWorld.Bootstrap(true);
                 testWorld.CreateWorlds(true, 1, false);
 
                 float dt = 16f / 1000f;
-                var entity = testWorld.ClientWorlds[0].EntityManager.CreateEntity(ComponentType.ReadWrite<GameProtocolVersion>());
-                testWorld.ClientWorlds[0].EntityManager.SetComponentData(entity, new GameProtocolVersion(){Version = 9000});
+                testWorld.ClientWorlds[0].EntityManager.CreateSingleton(new GameProtocolVersion(){Version = 9000});
                 testWorld.Tick(dt);
 
                 var ep = NetworkEndpoint.LoopbackIpv4;
                 ep.Port = 7979;
                 testWorld.GetSingletonRW<NetworkStreamDriver>(testWorld.ServerWorld).ValueRW.Listen(ep);
                 testWorld.GetSingletonRW<NetworkStreamDriver>(testWorld.ClientWorlds[0]).ValueRW.Connect(testWorld.ClientWorlds[0].EntityManager, ep);
-                testWorld.Tick(dt);
 
                 LogExpectProtocolError(testWorld, testWorld.ServerWorld, checkServer);
                 for (int i = 0; i < 8; ++i)
@@ -314,18 +619,22 @@ namespace Unity.NetCode.Tests
 
         void LogExpectProtocolError(NetCodeTestWorld testWorld, World world, bool checkServer)
         {
-            LogAssert.Expect(LogType.Error, new Regex($"\\[{(checkServer ? "Server" : "Client")}Test(.*)\\] RpcSystem received bad protocol version from NetworkConnection\\[id0,v1\\]"
-                                                      + $"\nLocal protocol: NetCode=1 Game={(checkServer ? "0" : "9000")} RpcCollection=(\\d+) ComponentCollection=(\\d+)"
-                                                      + $"\nRemote protocol: NetCode=1 Game={(!checkServer ? "0" : "9000")} RpcCollection=(\\d+) ComponentCollection=(\\d+)"));
+            LogAssert.Expect(LogType.Error, new Regex(@$"\[{(checkServer ? "Server" : "Client")}Test(.*)\] RpcSystem received bad protocol version from NetworkConnection\[id0,v1\]"
+                                                      + @$"\nLocal protocol: NPV\[NetCodeVersion:{NetworkProtocolVersion.k_NetCodeVersion}, GameVersion:{(checkServer ? "0" : "9000")}, RpcCollection:(\d+), ComponentCollection:(\d+)\]"
+                                                      + @$"\nRemote protocol: NPV\[NetCodeVersion:{NetworkProtocolVersion.k_NetCodeVersion}, GameVersion:{(!checkServer ? "0" : "9000")}, RpcCollection:(\d+), ComponentCollection:(\d+)\]"));
+            LogAssert.Expect(LogType.Error, "The Game version mismatched between remote and local. Ensure that you are using the same version of the game on both client and server.");
             var rpcs = testWorld.GetSingleton<RpcCollection>(world).Rpcs;
+            Assert.AreNotEqual(0, rpcs.Length, "Sanity.");
             LogAssert.Expect(LogType.Error, "RPC List (for above 'bad protocol version' error): " + rpcs.Length);
             for (int i = 0; i < rpcs.Length; ++i)
                 LogAssert.Expect(LogType.Error, new Regex("Unity.NetCode"));
             using var collection = world.EntityManager.CreateEntityQuery(ComponentType.ReadOnly<GhostCollection>());
-            var serializers = world.EntityManager.GetBuffer<GhostComponentSerializer.State>(collection.ToEntityArray(Allocator.Temp)[0]);
-            LogAssert.Expect(LogType.Error, "Component serializer data (for above 'bad protocol version' error): " + serializers.Length);
-            for (int i = 0; i < serializers.Length; ++i)
-                LogAssert.Expect(LogType.Error, new Regex("Type:"));
+            // GhostCollection serializers do not get reset to 0.
+            ref var ghostCollection = ref testWorld.GetSingletonRW<GhostComponentSerializerCollectionData>(testWorld.ClientWorlds[0]).ValueRW;
+            Assert.AreNotEqual(0, ghostCollection.Serializers.Length, $"Sanity: ghostCollection.Serializers.Length is zero");
+            LogAssert.Expect(LogType.Error, $"Component serializer data (for above 'bad protocol version' error): {ghostCollection.Serializers.Length}");
+            for (int i = 0; i < ghostCollection.Serializers.Length; ++i)
+                LogAssert.Expect(LogType.Error, new Regex(@$"ComponentHash\[{i}\] = Type:"));
         }
 
         public class TestConverter : TestNetCodeAuthoring.IConverter
@@ -354,11 +663,10 @@ namespace Unity.NetCode.Tests
                 testWorld.CreateGhostCollection(ghost1, ghost2);
 
                 testWorld.CreateWorlds(true, 1);
-                float frameTime = 1.0f / 60.0f;
                 var serverCollectionSingleton = testWorld.TryGetSingletonEntity<GhostCollection>(testWorld.ServerWorld);
                 var clientCollectionSingleton = testWorld.TryGetSingletonEntity<GhostCollection>(testWorld.ClientWorlds[0]);
                 //First tick: compute on both client and server the ghost collection hash
-                testWorld.Tick(frameTime);
+                testWorld.Tick();
                 Assert.AreEqual(GhostCollectionSystem.CalculateComponentCollectionHash(testWorld.ServerWorld.EntityManager.GetBuffer<GhostComponentSerializer.State>(serverCollectionSingleton)),
                     GhostCollectionSystem.CalculateComponentCollectionHash(testWorld.ClientWorlds[0].EntityManager.GetBuffer<GhostComponentSerializer.State>(clientCollectionSingleton)));
 
@@ -375,11 +683,11 @@ namespace Unity.NetCode.Tests
                 }
 
                 //Check that and server can connect (same component hash)
-                testWorld.Connect(frameTime);
+                testWorld.Connect();
 
                 testWorld.GoInGame();
                 for(int i=0;i<10;++i)
-                    testWorld.Tick(frameTime);
+                    testWorld.Tick();
 
                 Assert.IsTrue(testWorld.TryGetSingletonEntity<NetworkId>(testWorld.ClientWorlds[0]) != Entity.Null);
             }
@@ -432,4 +740,5 @@ namespace Unity.NetCode.Tests
             }
         }
     }
+#endif
 }

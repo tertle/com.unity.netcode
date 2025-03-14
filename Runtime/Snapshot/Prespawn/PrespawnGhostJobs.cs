@@ -76,7 +76,7 @@ namespace Unity.NetCode
             var typeData = GhostTypeCollection[ghostType];
             //collect the buffers size for each entity (and children)
             if (GhostTypeCollection[ghostType].NumBuffers > 0)
-                helper.GatherBufferSize(chunk, 0, typeData, ref buffersSize);
+                helper.GatherBufferSize(chunk, 0, chunk.Count, typeData, ref buffersSize);
 
             var snapshotSize = typeData.SnapshotSize;
             int changeMaskUints = GhostComponentSerializer.ChangeMaskArraySizeInUInts(typeData.ChangeMaskBits);
@@ -93,13 +93,15 @@ namespace Unity.NetCode
                 var dynamicDataCapacity = GhostComponentSerializer.SnapshotSizeAligned(sizeof(uint)) + buffersSize[i];
                 baselineBuffer.ResizeUninitialized(snapshotSize + dynamicDataCapacity);
                 var baselinePtr = baselineBuffer.GetUnsafePtr();
+                var headerSize = GhostComponentSerializer.SnapshotSizeAligned(sizeof(uint));
                 UnsafeUtility.MemClear(baselinePtr, baselineBuffer.Length);
-
                 helper.changeMaskUints = changeMaskUints;
                 helper.snapshotOffset = snapshotBaseOffset;
                 helper.snapshotPtr = (byte*) baselinePtr;
-                helper.snapshotDynamicPtr = (byte*) baselinePtr + snapshotSize;
-                helper.dynamicSnapshotDataOffset = GhostComponentSerializer.SnapshotSizeAligned(sizeof(uint));
+                //Prespawned ghost baseline assume the dynamic data offset is from the beginning of the buffer (because the server does that)
+                helper.snapshotDynamicHeaderPtr = (byte*)baselinePtr + snapshotSize;
+                helper.snapshotDynamicPtr = (byte*)baselinePtr + snapshotSize;
+                helper.dynamicSnapshotDataOffset = headerSize;
                 helper.snapshotSize = snapshotSize;
                 helper.dynamicSnapshotCapacity = baselineBuffer.Length - snapshotSize;
                 helper.CopyEntityToSnapshot(chunk, i, typeData, GhostSerializeHelper.ClearOption.DontClear);

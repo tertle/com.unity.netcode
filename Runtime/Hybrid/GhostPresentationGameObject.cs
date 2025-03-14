@@ -118,8 +118,7 @@ namespace Unity.NetCode.Hybrid
                     var owner = go.GetComponent<GhostPresentationGameObjectEntityOwner>();
                     if (owner != null)
                     {
-                        owner.World = World;
-                        owner.Entity = entity;
+                        owner.Initialize(entity, World);
                     }
                     idx = m_GameObjects.Count;
                     m_GameObjects.Add(go);
@@ -145,8 +144,11 @@ namespace Unity.NetCode.Hybrid
                     var last = m_GameObjects.Count - 1;
                     Object.Destroy(m_GameObjects[idx]);
                     m_GameObjects[idx] = m_GameObjects[last];
-                    ghostPresentationGameObjectStateFromEntity[m_Entities[idx]] = new GhostPresentationGameObjectState{GameObjectIndex = idx};
                     m_GameObjects.RemoveAt(last);
+                    if (idx != last)
+                    {
+                        ghostPresentationGameObjectStateFromEntity[m_Entities[idx]] = new GhostPresentationGameObjectState { GameObjectIndex = idx };
+                    }
                 }
                 EntityManager.RemoveComponent<GhostPresentationGameObjectState>(entity);
             }).Run();

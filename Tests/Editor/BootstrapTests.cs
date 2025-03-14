@@ -1,7 +1,7 @@
 using System;
-using System.Collections.Generic;
 using NUnit.Framework;
 using Unity.Entities;
+using Unity.Networking.Transport;
 
 namespace Unity.NetCode.Tests
 {
@@ -109,11 +109,11 @@ namespace Unity.NetCode.Tests
                 testWorld.Bootstrap(false);
                 testWorld.CreateWorlds(true, 1);
 
-                testWorld.Tick(1.0f / 60.0f);
+                testWorld.Tick();
                 testWorld.DisposeAllClientWorlds();
-                testWorld.Tick(1.0f / 60.0f);
+                testWorld.Tick();
                 testWorld.DisposeServerWorld();
-                testWorld.Tick(1.0f / 60.0f);
+                testWorld.Tick();
             }
         }
         [Test]
@@ -124,8 +124,68 @@ namespace Unity.NetCode.Tests
                 testWorld.Bootstrap(false);
                 testWorld.CreateWorlds(true, 1);
 
-                testWorld.Tick(1.0f / 60.0f);
+                testWorld.Tick();
                 testWorld.DisposeDefaultWorld();
+            }
+        }
+
+        [Test]
+        public void ResetNetworkDriverStore()
+        {
+            using var testWorld = new NetCodeTestWorld();
+            testWorld.Bootstrap(true);
+            testWorld.CreateWorlds(true, 1);
+
+            {
+                var serverDriver = testWorld.ServerWorld.EntityManager.CreateEntityQuery(typeof(NetworkStreamDriver)).GetSingleton<NetworkStreamDriver>();
+                var netDebug = testWorld.ServerWorld.EntityManager.CreateEntityQuery(typeof(NetDebug)).GetSingleton<NetDebug>();
+                //Check it is possible to change the driver if the world is in a stable state and there are no connection or listening interfaces.
+                var driverStore = new NetworkDriverStore();
+                var constructor = testWorld;
+                constructor.CreateServerDriver(testWorld.ServerWorld, ref driverStore, netDebug);
+                serverDriver.ResetDriverStore(testWorld.ServerWorld.Unmanaged, ref driverStore);
+            }
+            {
+                var clientDriver = testWorld.ClientWorlds[0].EntityManager.CreateEntityQuery(typeof(NetworkStreamDriver)).GetSingleton<NetworkStreamDriver>();
+                var netDebug = testWorld.ClientWorlds[0].EntityManager.CreateEntityQuery(typeof(NetDebug)).GetSingleton<NetDebug>();
+                //Check it is possible to change the driver if the world is in a stable state and there are no connection or listening interfaces.
+                var driverStore = new NetworkDriverStore();
+                var constructor = testWorld;
+                constructor.CreateClientDriver(testWorld.ClientWorlds[0], ref driverStore, netDebug);
+                clientDriver.ResetDriverStore(testWorld.ClientWorlds[0].Unmanaged, ref driverStore);
+            }
+            testWorld.Connect();
+        }
+        [Test]
+        public void ResetNetworkDriverStore_ThrowIfConnectionsArePresent()
+        {
+            using var testWorld = new NetCodeTestWorld();
+            testWorld.Bootstrap(true);
+            testWorld.CreateWorlds(true, 1);
+            testWorld.Connect();
+            {
+                var serverDriver = testWorld.ServerWorld.EntityManager.CreateEntityQuery(typeof(NetworkStreamDriver)).GetSingleton<NetworkStreamDriver>();
+                var netDebug = testWorld.ServerWorld.EntityManager.CreateEntityQuery(typeof(NetDebug)).GetSingleton<NetDebug>();
+                //Check it is possible to change the driver if the world is in a stable state and there are no connection or listening interfaces.
+                var driverStore = new NetworkDriverStore();
+                var constructor = testWorld;
+                constructor.CreateServerDriver(testWorld.ServerWorld, ref driverStore, netDebug);
+                Assert.Throws<InvalidOperationException>(() =>
+                {
+                    serverDriver.ResetDriverStore(testWorld.ServerWorld.Unmanaged, ref driverStore);
+                });
+            }
+            {
+                var clientDriver = testWorld.ClientWorlds[0].EntityManager.CreateEntityQuery(typeof(NetworkStreamDriver)).GetSingleton<NetworkStreamDriver>();
+                var netDebug = testWorld.ClientWorlds[0].EntityManager.CreateEntityQuery(typeof(NetDebug)).GetSingleton<NetDebug>();
+                //Check it is possible to change the driver if the world is in a stable state and there are no connection or listening interfaces.
+                var driverStore = new NetworkDriverStore();
+                var constructor = testWorld;
+                constructor.CreateClientDriver(testWorld.ClientWorlds[0], ref driverStore, netDebug);
+                Assert.Throws<InvalidOperationException>(() =>
+                {
+                    clientDriver.ResetDriverStore(testWorld.ClientWorlds[0].Unmanaged, ref driverStore);
+                });
             }
         }
     }

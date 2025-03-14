@@ -3,11 +3,14 @@ using Unity.Burst;
 using Unity.Collections;
 using Unity.Entities;
 using Unity.Collections.LowLevel.Unsafe;
+using UnityEngine;
 
 namespace Unity.NetCode
 {
     /// <summary>
+    /// <para>
     /// System responsible for spawning all the ghost entities for the client world.
+    /// </para>
     /// <para>
     /// When a ghost snapshot is received from the server, the <see cref="GhostReceiveSystem"/> add a spawning request to the <see cref="GhostSpawnBuffer"/>.
     /// After the spawning requests has been classified (see <see cref="GhostSpawnClassificationSystem"/>),
@@ -15,23 +18,21 @@ namespace Unity.NetCode
     /// </para>
     /// <para>
     /// Based on the spawning (<see cref="GhostSpawnBuffer.Type"/>), the requests are handled quite differently.
+    /// </para>
     /// <para>When the mode is set to <see cref="GhostSpawnBuffer.Type.Interpolated"/>, the ghost creation is delayed
     /// until the <see cref="NetworkTime.InterpolationTick"/> match (or is greater) the actual spawning tick on the server.
-    /// A temporary entity, holding the spawning information, the received snapshot data from the server, and tagged with the <seealso cref="PendingSpawnPlaceholder"/>
+    /// A temporary entity, holding the spawning information, the received snapshot data from the server, and tagged with the <see cref="PendingSpawnPlaceholder"/>
     /// is created. The entity will exists until the real ghost instance is spawned (or a de-spawn request has been received),
     /// and its sole purpose of receiving new incoming snapshots (even though they are not applied to the entity, since it is not a real ghost).
     /// </para>
     /// <para>
     /// When the mode is set to <see cref="GhostSpawnBuffer.Type.Predicted"/>, a new ghost instance in spawned immediately if the
     /// current simulated <see cref="NetworkTime.ServerTick"/> is greater or equals the spawning tick reported by the server.
-    /// <remarks>
     /// This condition is usually the norm, since the client timeline (the current simulated tick) should be ahead of the server.
-    /// </remarks>
+    /// </para>
     /// <para>
     /// Otherwise, the ghost creation is delayed until the the <see cref="NetworkTime.ServerTick"/> is greater or equals the required spawning tick.
     /// Like to interpolated ghost, a temporary placeholder entity is created to hold spawning information and for holding new received snapshots.
-    /// </para>
-    /// </para>
     /// </para>
     /// </summary>
     [BurstCompile]
@@ -53,6 +54,7 @@ namespace Unity.NetCode
 
         EntityQuery m_InGameGroup;
         EntityQuery m_NetworkIdQuery;
+        EntityQuery m_InstanceCount;
 
         public void OnCreate(ref SystemState state)
         {
@@ -60,6 +62,7 @@ namespace Unity.NetCode
             m_DelayedPredictedGhostSpawnQueue = new NativeQueue<DelayedSpawnGhost>(Allocator.Persistent);
             m_InGameGroup = state.GetEntityQuery(ComponentType.ReadOnly<NetworkStreamInGame>());
             m_NetworkIdQuery = state.GetEntityQuery(ComponentType.ReadOnly<NetworkId>(), ComponentType.Exclude<NetworkStreamRequestDisconnect>());
+            m_InstanceCount = state.GetEntityQuery(ComponentType.ReadOnly<GhostInstance>(), ComponentType.ReadWrite<Simulate>(), ComponentType.Exclude<PendingSpawnPlaceholder>());
 
             var ent = state.EntityManager.CreateEntity();
             state.EntityManager.SetName(ent, "GhostSpawnQueue");
@@ -93,6 +96,7 @@ namespace Unity.NetCode
             var prefabsEntity = SystemAPI.GetSingletonEntity<GhostCollection>();
             var prefabs = stateEntityManager.GetBuffer<GhostCollectionPrefab>(prefabsEntity).ToNativeArray(Allocator.Temp);
 
+            ref var ghostCount = ref SystemAPI.GetSingletonRW<GhostCount>().ValueRW;
             var ghostSpawnEntity = SystemAPI.GetSingletonEntity<GhostSpawnQueue>();
             var ghostSpawnBufferComponent = stateEntityManager.GetBuffer<GhostSpawnBuffer>(ghostSpawnEntity);
             var snapshotDataBufferComponent = stateEntityManager.GetBuffer<SnapshotDataBuffer>(ghostSpawnEntity);
@@ -221,6 +225,8 @@ namespace Unity.NetCode
                 }
             }
             ghostEntityMap.UpdateClientSpawnedGhosts(spawnedGhosts.AsArray(), netDebug);
+
+            ghostCount.m_GhostCompletionCount[2] = m_InstanceCount.CalculateEntityCountWithoutFiltering();
         }
 
         void ConfigurePrespawnGhost(ref EntityManager entityManager, Entity entity, in GhostSpawnBuffer ghost)
@@ -253,6 +259,9 @@ namespace Unity.NetCode
             bool hasBuffers = ghostTypeCollection[ghost.GhostType].NumBuffers > 0;
 
             var entity = entityManager.CreateEntity();
+#if !DOTS_DISABLE_DEBUG_NAMES
+            entityManager.SetName(entity, $"GHOST-PLACEHOLDER-{ghost.GhostType}");
+#endif
             entityManager.AddComponentData(entity, new GhostInstance { ghostId = ghost.GhostID, ghostType = ghost.GhostType, spawnTick = ghost.ServerSpawnTick });
             entityManager.AddComponent<PendingSpawnPlaceholder>(entity);
             if (PrespawnHelper.IsPrespawnGhostId(ghost.GhostID))

@@ -1,4 +1,5 @@
 using System;
+using System.Runtime.InteropServices;
 using Unity.Entities;
 
 using Unity.Collections;
@@ -9,34 +10,58 @@ using Unity.Networking.Transport.Error;
 namespace Unity.NetCode
 {
     ///<summary>
-    /// A connection is represented by an entity having a NetworkStreamConnection.
+    /// <para>A connection is represented by an entity having a NetworkStreamConnection.
     /// The component hold a reference to the underlying transport <see cref="NetworkConnection"/> and the <see cref="NetworkDriver"/>
     /// that created it.
-    /// All connections share a common set of components:
+    /// All connections share a common set of components:</para>
     /// <para>- <see cref="NetworkId"/></para>
     /// <para>- <see cref="IncomingRpcDataStreamBuffer"/></para>
     /// <para>- <see cref="OutgoingCommandDataStreamBuffer"/></para>
     /// <para>- <see cref="OutgoingRpcDataStreamBuffer"/></para>
     /// <para>- <see cref="PrespawnSectionAck"/></para>
     /// <para>- <see cref="CommandTarget"/></para>
-    /// Client connections also have a <see cref="IncomingSnapshotDataStreamBuffer"/> to handle server ghost snapshots.
+    /// <para>Client connections also have a <see cref="IncomingSnapshotDataStreamBuffer"/> to handle server ghost snapshots.</para>
     ///</summary>
-    public struct NetworkStreamConnection : IComponentData
+    /// <remarks>Never destroy this entity yourself. You'll receive an error if you attempt to do so.</remarks>
+    public struct NetworkStreamConnection : ICleanupComponentData
     {
         /// <summary>
-        /// The underlyng transport <see cref="NetworkConnection"/>
+        /// The underlying transport <see cref="NetworkConnection"/>
         /// </summary>
         public NetworkConnection Value;
+
         /// <summary>
         /// The driver identifier that create the connection. Can be used to retrieve the <see cref="NetworkDriver"/> or the
         /// <see cref="NetworkDriverStore.NetworkDriverInstance"/> from the <see cref="NetworkDriverStore"/>.
         /// </summary>
         public int DriverId;
+
         /// <summary>
         /// Flag used to mark if the connection has exchanged the protocol version.
-        /// 1 indicates that the remote version protocol has been received.
+        /// 1 indicates that the remote version protocol has been received AND accepted (i.e. it's valid)!
         /// </summary>
         public int ProtocolVersionReceived;
+
+        /// <summary>
+        /// Cache of the last state pulled from the driver.
+        /// </summary>
+        /// <remarks>May be stale, as only refreshed once per <see cref="SimulationSystemGroup"/> tick.</remarks>
+        public ConnectionState.State CurrentState;
+
+        /// <summary>
+        /// Server-only: The timestamp at which the connection was accepted on the server.
+        /// This is then used to detect if a connection handshake or approval timeout has occured.
+        /// </summary>
+        internal uint ConnectionApprovalTimeoutStart;
+
+        /// <summary>
+        /// In cases where we update the state outside the event raising logic, this way it'll get picked up by the next update
+        /// </summary>
+        [MarshalAs(UnmanagedType.U1)]
+        internal bool CurrentStateDirty;
+
+        /// <summary>Helper.</summary>
+        internal bool IsHandshakeOrApproval => CurrentState is ConnectionState.State.Handshake or ConnectionState.State.Approval;
     }
 
     /// <summary>
@@ -44,6 +69,23 @@ namespace Unity.NetCode
     /// Before adding this component the connection only processes RPCs. Must be Added by game logic to start sending snapshots and commands.
     /// </summary>
     public struct NetworkStreamInGame : IComponentData
+    {
+    }
+
+    /// <summary>
+    /// Add this component to a ServerWorld network connection entity, to denote that it has been approved by your logic.
+    /// It will be added automatically on the client, once the connection is approved.
+    /// </summary>
+    /// <remarks>
+    /// Typically: The flow is that you'll send a game-specific <see cref="IApprovalRpcCommand"/> to the server,
+    /// containing a authentication secret fetched from your game backend. The server RPC handling logic then needs
+    /// to authenticate this secret, and - if valid - add this component to denote (to netcode) that this connection is
+    /// approved.
+    /// <br/>If the client fails authentication, either allow them to timeout, or manually disconnect them with
+    /// <see cref="NetworkStreamDisconnectReason.ApprovalFailure"/>.
+    /// </remarks>
+    /// <seealso cref="ClientServerTickRate.HandshakeApprovalTimeoutMS"/>
+    public struct ConnectionApproved : IComponentData
     {
     }
 
@@ -61,9 +103,9 @@ namespace Unity.NetCode
     public struct NetworkStreamSnapshotTargetSize : IComponentData
     {
         /// <summary>
-        /// The desired packet size to use for the snapshot. By default, the packet size is the <see cref="NetworkParameterConstants.MTU"/>
+        /// The desired packet size to use for the snapshot. By default, the packet size is the <see cref="NetworkParameterConstants.MaxMessageSize"/>
         /// minus some headers.
-        /// It is possible to specify a packet size larger than a single <see cref="NetworkParameterConstants.MTU"/>, in which case the
+        /// It is possible to specify a packet size larger than a single <see cref="NetworkParameterConstants.MaxMessageSize"/>, in which case the
         /// snapshot data is sent using a pipeline that support fragmentation (see <see cref="NetworkDriverStore.NetworkDriverInstance.unreliableFragmentedPipeline"/>.
         /// The upper bound limit for this value is payload capacity of the fragmentation pipeline (see <see cref="Unity.Networking.Transport.Utilities.FragmentationUtility"/>).
         /// </summary>
@@ -80,21 +122,36 @@ namespace Unity.NetCode
     public enum NetworkStreamDisconnectReason
     {
         /// <inheritdoc cref="DisconnectReason.Default"/>
-        ConnectionClose,
+        ConnectionClose = DisconnectReason.Default,
         /// <inheritdoc cref="DisconnectReason.Timeout"/>
-        Timeout,
+        Timeout = DisconnectReason.Timeout,
         /// <inheritdoc cref="DisconnectReason.MaxConnectionAttempts"/>
-        MaxConnectionAttempts,
+        MaxConnectionAttempts = DisconnectReason.MaxConnectionAttempts,
         /// <inheritdoc cref="DisconnectReason.ClosedByRemote"/>
-        ClosedByRemote,
+        ClosedByRemote = DisconnectReason.ClosedByRemote,
         /// <summary>NetCode-specific: Denotes that we've detected an unknown or unexpected ghost hash, implying that this is an incompatible server/client pair.</summary>
-        BadProtocolVersion,
+        BadProtocolVersion = 4,
         /// <summary>NetCode-specific: Denotes that we've detected a hash miss-match in an RPC, or an unknown RPC. Implies that this is an incompatible server/client pair.</summary>
-        InvalidRpc,
+        InvalidRpc = 5,
         /// <inheritdoc cref="DisconnectReason.AuthenticationFailure"/>
-        AuthenticationFailure,
+        AuthenticationFailure = DisconnectReason.AuthenticationFailure,
         /// <inheritdoc cref="DisconnectReason.ProtocolError"/>
-        ProtocolError,
+        ProtocolError = DisconnectReason.ProtocolError,
+        /// <summary>
+        /// NetCode-specific: Denotes that the client's internal netcode logic has failed to send the
+        /// <see cref="RequestProtocolVersionHandshake"/> to the server within the given <see cref="ClientServerTickRate.HandshakeApprovalTimeoutMS"/>.
+        /// </summary>
+        /// <remarks>Is your approval timeout too short? If not, may indicate a netcode error.</remarks>
+        HandshakeTimeout = 100,
+        /// <summary>NetCode-specific: Denotes that the client has failed approval, by inputting invalid credentials.</summary>
+        /// <remarks>Must be invoked by your own code, when handling <see cref="IApprovalRpcCommand"/> RPCs.</remarks>
+        ApprovalFailure = 101,
+        /// <summary>
+        /// NetCode-specific: Denotes that the client has failed to be approved by the server within the given
+        /// <see cref="ClientServerTickRate.HandshakeApprovalTimeoutMS"/>.
+        /// </summary>
+        /// <remarks>In other words: The client failed to send a <see cref="IApprovalRpcCommand"/> RPC when asked to.</remarks>
+        ApprovalTimeout = 102,
     }
 
     /// <summary>
@@ -104,6 +161,13 @@ namespace Unity.NetCode
     /// By adding the ConnectionState state component, the connection <see cref="NetworkId"/> and <see cref="DisconnectReason"/>
     /// are retained until the game don't remove the state component.
     /// </summary>
+    /// <remarks>
+    /// We are considering deprecating or replacing this. Prefer <see cref="NetworkStreamDriver.ConnectionEventsForTick"/> as it:
+    /// <list type="bullet">
+    /// <item>Supports multiple consumers (i.e. subscribers in the pub/sub model).</item>
+    /// <item>Reduces boilerplate.</item>
+    /// </list>
+    /// </remarks>
     public struct ConnectionState : ICleanupComponentData
     {
         /// <summary>
@@ -125,13 +189,18 @@ namespace Unity.NetCode
             Connecting,
             /// <summary>
             /// The client connected to the server and is exchanging some initial messages, such as verify the <see cref="NetworkProtocolVersion"/>
-            /// and <see cref="GameProtocolVersion"/> are compatible, and assign the network id.
+            /// and <see cref="GameProtocolVersion"/> are compatible.
             /// </summary>
             Handshake,
             /// <summary>
-            /// The connection has been established, the handshake is termiated and the connection is now fully connected.
+            /// Connection is connected on the transport level but needs to be approved before continuing to the handshake.
             /// </summary>
-            Connected
+            Approval,
+            /// <summary>
+            /// The connection has been established, the handshake is completed, and the connection is now fully connected.
+            /// A <see cref="NetworkId"/> component is added to the Network Connection as we enter this state.
+            /// </summary>
+            Connected,
         }
 
         /// <summary>
@@ -148,13 +217,13 @@ namespace Unity.NetCode
         public NetworkStreamDisconnectReason DisconnectReason;
 
         /// <summary>
-        /// Check if two connection state are equals. They are if:
+        /// <para>Check if two connection state are equals. They are if:</para>
         /// <para>- The <see cref="State"/> is the same.</para>
         /// <para>- The <see cref="NetworkId"/> is the same.</para>
         /// <para>- The <see cref="DisconnectReason"/> is the same.</para>
         /// </summary>
         /// <param name="other">The component to compare</param>
-        /// <returns></returns>
+        /// <returns>Whether the two connection state are equal.</returns>
         public bool Equals(ConnectionState other) => CurrentState == other.CurrentState && NetworkId == other.NetworkId && DisconnectReason == other.DisconnectReason;
     }
 
@@ -298,8 +367,8 @@ namespace Unity.NetCode
     /// <summary>
     /// One per NetworkConnection.
     /// Stores the incoming, yet-to-be-processed snapshot stream data for a connection.
-    /// Each snapshot is designed to fit inside <see cref="NetworkParameterConstants.MTU"/>,
-    /// so expect this to be MTU or less.
+    /// Each snapshot is designed to fit inside <see cref="NetworkParameterConstants.MaxMessageSize"/>,
+    /// so expect this to be MaxMessageSize or less.
     /// </summary>
     [InternalBufferCapacity(0)]
     public struct IncomingSnapshotDataStreamBuffer : IBufferElementData

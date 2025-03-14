@@ -11,11 +11,7 @@ namespace Unity.NetCode
     struct GhostPrefabConfigBaking
     {
         public UnityObjectRef<GhostAuthoringComponent> Authoring;
-        public int Importance;
-        public GhostModeMask SupportedGhostModes;
-        public GhostMode DefaultGhostMode;
-        public GhostOptimizationMode OptimizationMode;
-        public bool UsePreSerialization;
+        public GhostPrefabCreation.Config Config;
     }
 
     // This type contains all the information pulled from the authoring component in the baker
@@ -50,7 +46,7 @@ namespace Unity.NetCode
         public ulong ComponentVariant;
     }
 
-    [BakingVersion("cmarastoni", 1)]
+    [BakingVersion("cmarastoni", 2)]
     class GhostAuthoringComponentBaker : Baker<GhostAuthoringComponent>
     {
         public override void Bake(GhostAuthoringComponent ghostAuthoring)
@@ -120,14 +116,10 @@ namespace Unity.NetCode
             var bakingConfig = new GhostPrefabConfigBaking
             {
                 Authoring = ghostAuthoring,
-                Importance = ghostAuthoring.Importance,
-                SupportedGhostModes = ghostAuthoring.SupportedGhostModes,
-                DefaultGhostMode = ghostAuthoring.DefaultGhostMode,
-                OptimizationMode = ghostAuthoring.OptimizationMode,
-                UsePreSerialization = ghostAuthoring.UsePreSerialization
+                Config = ghostAuthoring.AsConfig(ghostName),
             };
 
-            // Generate a ghost type component so the ghost can be identified by mathcing prefab asset guid
+            // Generate a ghost type component so the ghost can be identified by matching prefab asset guid
             var ghostType = GhostType.FromHash128String(ghostAuthoring.prefabId);
             var activeInScene = IsActive();
 
@@ -150,7 +142,7 @@ namespace Unity.NetCode
                     AddComponent<GhostPrefabRuntimeStrip>(entity);
             }
 
-            if (isPrefab && (target != NetcodeConversionTarget.Server) && (bakingConfig.SupportedGhostModes != GhostModeMask.Interpolated))
+            if (isPrefab && (target != NetcodeConversionTarget.Server) && (bakingConfig.Config.SupportedGhostModes != GhostModeMask.Interpolated))
                 AddComponent<PredictedGhostSpawnRequest>(entity);
         }
     }
@@ -418,29 +410,19 @@ namespace Unity.NetCode
                     }
                 }
 
-                GhostPrefabCreation.Config config = new GhostPrefabCreation.Config
-                {
-                    Name = ghostAuthoringBakingData.GhostName,
-                    Importance = ghostAuthoringBakingData.BakingConfig.Importance,
-                    SupportedGhostModes = ghostAuthoringBakingData.BakingConfig.SupportedGhostModes,
-                    DefaultGhostMode = ghostAuthoringBakingData.BakingConfig.DefaultGhostMode,
-                    OptimizationMode = ghostAuthoringBakingData.BakingConfig.OptimizationMode,
-                    UsePreSerialization = ghostAuthoringBakingData.BakingConfig.UsePreSerialization
-                };
-
-                GhostPrefabCreation.FinalizePrefabComponents(config, EntityManager,
+                GhostPrefabCreation.FinalizePrefabComponents(ghostAuthoringBakingData.BakingConfig.Config, EntityManager,
                     rootEntity, ghostAuthoringBakingData.GhostType, linkedEntities,
                     allComponents, componentCounts, ghostAuthoringBakingData.Target, prefabTypes);
 
                 if (ghostAuthoringBakingData.IsPrefab)
                 {
-                    var contentHash = TypeHash.FNV1A64(ghostAuthoringBakingData.BakingConfig.Importance);
+                    var contentHash = TypeHash.FNV1A64(ghostAuthoringBakingData.BakingConfig.Config.Importance);
                     contentHash = TypeHash.CombineFNV1A64(contentHash,
-                        TypeHash.FNV1A64((int) ghostAuthoringBakingData.BakingConfig.SupportedGhostModes));
+                        TypeHash.FNV1A64((int) ghostAuthoringBakingData.BakingConfig.Config.SupportedGhostModes));
                     contentHash = TypeHash.CombineFNV1A64(contentHash,
-                        TypeHash.FNV1A64((int) ghostAuthoringBakingData.BakingConfig.DefaultGhostMode));
+                        TypeHash.FNV1A64((int) ghostAuthoringBakingData.BakingConfig.Config.DefaultGhostMode));
                     contentHash = TypeHash.CombineFNV1A64(contentHash,
-                        TypeHash.FNV1A64((int) ghostAuthoringBakingData.BakingConfig.OptimizationMode));
+                        TypeHash.FNV1A64((int) ghostAuthoringBakingData.BakingConfig.Config.OptimizationMode));
                     contentHash = TypeHash.CombineFNV1A64(contentHash, ghostAuthoringBakingData.GhostNameHash);
                     for (int i = 0; i < componentCounts[0]; ++i)
                     {
@@ -473,7 +455,7 @@ namespace Unity.NetCode
                     // instanceIds[0] contains the root GameObject instance id
                     if (context.NeedToComputeBlobAsset(blobHash))
                     {
-                        var blobAsset = GhostPrefabCreation.CreateBlobAsset(config,
+                        var blobAsset = GhostPrefabCreation.CreateBlobAsset(ghostAuthoringBakingData.BakingConfig.Config,
                             EntityManager, rootEntity, linkedEntities,
                             allComponents, componentCounts, ghostAuthoringBakingData.Target, prefabTypes,
                             sendMasksOverride, variants);

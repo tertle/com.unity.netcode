@@ -5,6 +5,7 @@ using Unity.Collections.LowLevel.Unsafe;
 using Unity.NetCode.LowLevel.Unsafe;
 using System;
 using Unity.Assertions;
+using Unity.Burst.CompilerServices;
 using Unity.Burst.Intrinsics;
 using Unity.Jobs;
 
@@ -28,17 +29,23 @@ namespace Unity.NetCode
     public struct PredictedGhostSpawn : IBufferElementData
     {
         /// <summary>
-        /// The entitis that has been spawned
+        /// The Entity that has been spawned.
         /// </summary>
         public Entity entity;
         /// <summary>
-        /// The index inside the <see cref="GhostCollectionPrefab"/> that identify the type of ghost to be spawned.
+        /// The index of the ghost type in the <see cref="GhostCollectionPrefab"/> collection. Used to classify the ghost (<see cref="GhostSpawnClassificationSystem"/>).
         /// </summary>
         public int ghostType;
         /// <summary>
         /// The server tick the entity has been spawned.
         /// </summary>
         public NetworkTick spawnTick;
+
+        /// <summary>Helper.</summary>
+        /// <returns>Formatted informational string.</returns>
+        public FixedString128Bytes ToFixedString() => $"PredictedGhostSpawn[ghostType:{ghostType},st:{spawnTick.ToFixedString()},ent:{entity.ToFixedString()}]";
+        /// <inheritdoc cref="ToFixedString"/>
+        public override string ToString() => ToFixedString().ToString();
     }
 
     /// <summary>
@@ -147,7 +154,7 @@ namespace Unity.NetCode
                 var bufferSizes = new NativeArray<int>(chunk.Count, Allocator.Temp);
                 var hasBuffers = GhostTypeCollection[ghostType].NumBuffers > 0;
                 if (hasBuffers)
-                    helper.GatherBufferSize(chunk, 0, typeData, ref bufferSizes);
+                    helper.GatherBufferSize(chunk, 0, chunk.Count, typeData, ref bufferSizes);
 
                 for (int i = 0; i < entityList.Length; ++i)
                 {
@@ -181,13 +188,16 @@ namespace Unity.NetCode
                         var headerSize = SnapshotDynamicBuffersHelper.GetHeaderSize();
                         snapshotDynamicDataBuffer.ResizeUninitialized((int)dynamicDataCapacity);
 
-                        helper.snapshotDynamicPtr = (byte*)snapshotDynamicDataBuffer.GetUnsafePtr();
-                        helper.dynamicSnapshotDataOffset = (int)headerSize;
-                        //add the header size so that the boundary check that into the consideration the header size
-                        helper.dynamicSnapshotCapacity = (int)(dynamicSnapshotSize + headerSize);
+                        //Explanation: on the client the dynamic buffer data offset is relative to the beginning of
+                        //the dynamic data slot, not to the header.
+                        //That means, the dynamicSnapshotDataOffset always start from 0, and the data instead
+                        //start right after the header (for the first slot).
+                        helper.snapshotDynamicPtr = (byte*)snapshotDynamicDataBuffer.GetUnsafePtr() + headerSize;
+                        helper.snapshotDynamicHeaderPtr = (byte*)snapshotDynamicDataBuffer.GetUnsafePtr();
+                        helper.dynamicSnapshotDataOffset = 0;
+                        helper.dynamicSnapshotCapacity = (int)(dynamicSnapshotSize);
                     }
                     helper.CopyEntityToSnapshot(chunk, i, typeData, GhostSerializeHelper.ClearOption.DontClear);
-
                     // Remove request component
                     commandBuffer.RemoveComponent<PredictedGhostSpawnRequest>(entity);
                     // Add to list of predictive spawn component - maybe use a singleton for this so spawn systems can just access it too
@@ -197,13 +207,17 @@ namespace Unity.NetCode
                 bufferSizes.Dispose();
             }
         }
+        /// <summary>
+        ///     Destroy client predicted spawns which are too old.
+        ///     I.e. The ones which did NOT get classified, and therefore were not already removed from this list.
+        /// </summary>
         [BurstCompile]
-        struct CleanupPredictedSpawn : IJob
+        struct CleanupPredictedSpawns : IJob
         {
             public Entity spawnListEntity;
             public BufferLookup<PredictedGhostSpawn> spawnListFromEntity;
             public NativeReference<int> listHasData;
-            public NetworkTick interpolatedTick;
+            public NetworkTick destroyTick;
             public EntityCommandBuffer commandBuffer;
             public void Execute()
             {
@@ -211,12 +225,11 @@ namespace Unity.NetCode
                 for (int i = 0; i < spawnList.Length; ++i)
                 {
                     var ghost = spawnList[i];
-                    if (interpolatedTick.IsValid && interpolatedTick.IsNewerThan(ghost.spawnTick))
+                    if (Hint.Unlikely(destroyTick.IsNewerThan(ghost.spawnTick)))
                     {
                         // Destroy entity and remove from list
                         commandBuffer.DestroyEntity(ghost.entity);
-                        spawnList[i] = spawnList[spawnList.Length - 1];
-                        spawnList.RemoveAt(spawnList.Length - 1);
+                        spawnList.RemoveAtSwapBack(i);
                         --i;
                     }
                 }
@@ -325,16 +338,21 @@ namespace Unity.NetCode
                 state.Dependency = initJob.ScheduleByRef(m_GhostInitQuery, state.Dependency);
             }
 
-            if (hasExisting)
+            if (hasExisting && networkTime.InterpolationTick.IsValid)
             {
-                // Validate all ghosts in the list of predictive spawn ghosts and destroy the ones which are too old
-                var cleanupJob = new CleanupPredictedSpawn
+                if(!SystemAPI.TryGetSingleton(out ClientTickRate clientTickRate))
+                    clientTickRate = NetworkTimeSystem.DefaultClientTickRate;
+
+                var destroyTick = networkTime.InterpolationTick;
+                destroyTick.Subtract(clientTickRate.NumAdditionalClientPredictedGhostLifetimeTicks);
+
+                var cleanupJob = new CleanupPredictedSpawns
                 {
                     spawnListEntity = spawnListEntity,
                     spawnListFromEntity = m_PredictedGhostSpawnFromEntity,
                     listHasData = m_ListHasData,
-                    interpolatedTick = networkTime.InterpolationTick,
-                    commandBuffer = commandBuffer
+                    destroyTick = destroyTick,
+                    commandBuffer = commandBuffer,
                 };
                 state.Dependency = cleanupJob.Schedule(state.Dependency);
             }

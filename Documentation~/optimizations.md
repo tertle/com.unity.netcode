@@ -1,4 +1,4 @@
-# Optimizations
+# Optimizing your game
 
 Netcode optimizations fall into two categories:
 
@@ -20,16 +20,43 @@ When a GhostField change Netcode will send the changes regardless of this settin
 
 ### Physics Scheduling
 
-Context: [Prediction](prediction.md) & [Physics](physics.md).
+Context: [Prediction](intro-to-prediction.md) and [Physics](physics.md).
 As the `PhysicsSimulationGroup` is run inside the `PredictedFixedStepSimulationSystemGroup`, you may encounter scheduling overhead when running at a high ping (i.e. re-simulating 20+ frames).
 You can reduce this scheduling overhead by forcing the majority of Physics work onto the main thread. Add a `PhysicsStep` singleton to your scene, and set `Multi Threaded` to `false`.
 Of course, we are always exploring ways to reduce scheduling overhead._
 
 ### Prediction Switching
 
-The cost of prediction increases with each predicted ghost. 
+The cost of prediction increases with each predicted ghost.
 Thus, as an optimization, we can opt-out of predicting a ghost given some set of criteria (e.g. distance to your clients character controller).
-See [Prediction Switching](prediction.md#prediction-switching) for details.
+See [Prediction Switching](prediction-switching.md) for details.
+
+### Using `MaxSendRate` to reduce Client Prediction Costs
+Predicted ghosts are particularly impacted by the `GhostAuthoringComponent.MaxSendRate` setting, because we only rollback and re-simulate a predicted ghost after it is received in a snapshot.
+Therefore, reducing the frequency by which a ghost chunk is added to the snapshot indirectly reduces predicted ghost re-simulation rate, saving client CPU cycles in aggregate.
+However, it may cause larger client misprediction errors, which leads to larger corrections, which can be observed by players. As always, it is a trade-off.
+
+## Executing Expensive Operations during Off Frames
+On client-hosted servers, your game can be set at a tick rate of 30Hz and a frame rate of 60Hz (if your ClientServerTickRate.TargetFrameRateMode is set to BusyWait). Your host would execute 2 frames for every tick. In other words, your game would be less busy one frame out of two. This can be used to do extra operations during those "off frames".
+To access whether a tick will execute during the frame, you can access the server world's rate manager to get that info.
+
+> [!NOTE]
+> A server world isn't idle during off frames and can time-slice its data sending to multiple connections if there's enough connections and enough off frames. For example, a server with 10 connections can send data to 5 connections one frame and the other 5 the next frame if its tick rate is low enough.
+
+
+```cs
+[WorldSystemFilter(WorldSystemFilterFlags.ServerSimulation)]
+[UpdateInGroup(typeof(InitializationSystemGroup))]
+public partial class DoExtraWorkSystem : SystemBase
+{
+    protected override void OnUpdate()
+    {
+        var serverRateManager = ClientServerBootstrap.ServerWorld.GetExistingSystemManaged&lt;SimulationSystemGroup&gt;().RateManager as NetcodeServerRateManager;
+        if (!serverRateManager.WillUpdate())
+            DoExtraWork(); // We know this frame will be less busy, we can do extra work
+    }
+}
+```
 
 ## Serialization cost
 
@@ -57,25 +84,40 @@ _Note that applying this setting will cause **all** ghosts to default to **not b
 * **SetIsIrrelevant** - Ghosts added to relevancy set (`GhostRelevancySet`, below) are considered "not-relevant to that client", and thus will be not serialized for the specified connection. In other words: Set this mode if you want to specifically ignore specific entities for a given client.
 
 `GhostRelevancySet` is the map that stores a these (connection, ghost) pairs. The behaviour (of adding a (connection, ghost) item) is determined according to the above rule.
-
+`GlobalRelevantQuery` is a global rule denoting that all ghost chunks matching this query are always considered relevant to all connections (unless you've added the ghosts in said chunk to the `GhostRelevancySet`). This is useful for creating general relevancy rules (e.g. "the entities in charge of tracking player scores are always relevant"). `GhostRelevancySet` takes precedence over this rule. See the [example](https://github.com/Unity-Technologies/EntityComponentSystemSamples/tree/master/NetcodeSamples/Assets/Samples/Asteroids/Authoring/Server/SetAlwaysRelevantSystem.cs) in Asteroids.
+```c#
+var relevancy = SystemAPI.GetSingletonRW<GhostRelevancy>();
+relevancy.ValueRW.DefaultRelevancyQuery = GetEntityQuery(typeof(AsteroidScore));
+```
 > [!NOTE]
 > If a ghost has been replicated to a client, then is set to **not be** relevant to said client, that client will be notified that this entity has been **destroyed**, and will do so. This misnomer can be confusing, as the entity being despawned does not imply the server entity was destroyed.
 > Example: Despawning an enemy monster in a MOBA because it became hidden in the Fog of War should not trigger a death animation (nor S/VFX). Thus, use some other data to notify what kind of entity-destruction state your entity has entered (e.g. enabling an `IsDead`/`IsCorpse` component).
 
 ## Limiting Snapshot Size
 
-* The per-connection component `NetworkStreamSnapshotTargetSize` will stop serializing entities into a snapshot if/when the snapshot goes above the specified byte size (`Value`). This is a way to try to enforce a (soft) limit on per-connection bandwidth consumption.
+* Use `GhostAuthoringComponent.MaxSendRate` to broadly reduce/clamp the resend rate of each of your ghost prefab types.
+It is an effective tool to reduce total bandwidth consumption, particularly in cases where your snapshot is always filling up with large ghosts with high priorities.
+_For example: A "LootItem" ghost prefab type can be told to only replicate - at most - on every tenth snapshot, by setting `MaxSendRate` to 10._
+
+* The per-connection component `NetworkStreamSnapshotTargetSize` will stop serializing entities into a snapshot if/when the snapshot goes above the specified byte size (`Value`).
+This is a way to try to enforce a (soft) limit on per-connection bandwidth consumption.
+To apply this limit globally, set a non-zero value in `GhostSendSystemData.DefaultSnapshotPacketSize`. 
+
+> [!NOTE]
+> Note that `MaxSendRate` is distinct from `Importance`: The former enforces a cap on the resend interval, whereas the latter informs the `GhostSendSystem` of which ghost chunks should be prioritized in the next snapshot.
+> Therefore, `MaxSendRate` can be thought of as a gating mechanism (much like its predecessor; `MinSendImportance`).
 
 > [!NOTE]
 > Snapshots do have a minimum send size. This is because - per snapshot - we ensure that _some_ new and destroyed entities are replicated, and we ensure that at least one ghost has been replicated.
 
-* `GhostSendSystemData.MaxSendEntities` can be used to limit the max number of entities added to any given snapshot.
+* `GhostSendSystemData.MaxSendChunks` can be used to limit the max number of chunks added to any given snapshot.
 
-* Similarly, `GhostSendSystemData.MaxSendChunks` can be used to limit the max number of chunks added to any given snapshot.
+* `GhostSendSystemData.MaxIterateChunks` can be used to limit the total number of chunks the `GhostSendSystem` will iterate over & serialize when looking for ghosts to replicate. 
+Very useful when dealing with thousands of static ghosts. 
 
-* `GhostSendSystemData.MinSendImportance` can be used to prevent a chunks entities from being sent too frequently.
-  _For example: A "DroppedItems" ghostType can be told to only replicate on every tenth snapshot, by setting `MinSendImportance` to 10, and dropped item `Importance` to 1._
-  `GhostSendSystemData.FirstSendImportanceMultiplier` can be used to bump the priority of chunks containing new entities, to ensure they're replicated quickly, regardless of the above setting.
+* `GhostSendSystemData.MinSendImportance` can be used to prevent a chunks entities from being sent too frequently. 
+__As of 1.4, prefer `GhostAuthoringComponent.MaxSendRate` over this global.__
+`GhostSendSystemData.FirstSendImportanceMultiplier` can be used to bump the priority of chunks containing new entities, to ensure they're replicated quickly, regardless of the above setting.
 
 > [!NOTE]
 > The above optimizations are applied on the per-chunk level, and they kick in **_after_** a chunks contents have been added to the snapshot. Thus, in practice, real send values will be higher.
@@ -104,14 +146,14 @@ The fields you can set on this is:
 Flow: The function pointer is invoked by the `GhostSendSystem` for each chunk, and returns the importance scaling for the entities contained within this chunk. The signature of the method is of the delegate type `GhostImportance.ScaleImportanceDelegate`.
 The parameters are `IntPtr`s, which point to instances of the three types of data described above.
 
-You must add a `GhostConnectionComponentType` component to each connection to determine which tile the connection should prioritize. 
+You must add a `GhostConnectionComponentType` component to each connection to determine which tile the connection should prioritize.
 As mentioned, this `GhostSendSystem` passes this per-connection information to the `ScaleImportanceFunction` function.
 
-The `GhostImportanceDataType` is global, static, singleton data, which configures how chunks are constructed. It's optional, and `IntPtr.Zero` will be passed if it is not found. 
-**Importantly: This static data _must_ be added to the same entity that holds the `GhostImportance` singleton. You'll get an exception in the editor if this type is not found here.** 
+The `GhostImportanceDataType` is global, static, singleton data, which configures how chunks are constructed. It's optional, and `IntPtr.Zero` will be passed if it is not found.
+**Importantly: This static data _must_ be added to the same entity that holds the `GhostImportance` singleton. You'll get an exception in the editor if this type is not found here.**
 `GhostSendSystem` will fetch this singleton data, and pass it to the importance scaling function.
 
-`GhostImportancePerChunkDataType` is added to each ghost, essentially forcing it into a specific chunk. The `GhostSendSystem` expects the type to be a shared component. This ensures that the elements in the same chunk will be grouped together by the entity system. 
+`GhostImportancePerChunkDataType` is added to each ghost, essentially forcing it into a specific chunk. The `GhostSendSystem` expects the type to be a shared component. This ensures that the elements in the same chunk will be grouped together by the entity system.
 A user-created system is required to update each entity's chunk to regroup them (example below). It's important to think about how entity transfer between chunks actually works (i.e. the performance implications), as regularly changing an entities chunk will not be performant.
 
 ## Distance-based importance
@@ -186,3 +228,24 @@ You simply need to:
 3. Define your own version of a `GhostDistancePartitioningSystem` which moves your entities between chunks (via writing to the shared component).
 
 Job done!
+
+## Avoid rollback predicted ghost on structural changes
+When the client predict ghost (either using predicted or owner-predicted mode), in case of structural changes (add/remove component on a ghost), the entity
+state is rollback to the `latest received` snapshot from the server and re-simulated up to the current client predicted server tick.
+
+This behavior is due to the fact, in case of structural changes, the current prediction history backup for the entity is "invalidated", and we don't continue predicting
+since the last fully simulated tick (backup). We do that to ensure that when component are re-added the state of the component is re-predicted (even though this is a fair assumption, it still an approximation, because the other entities are not doing the same),
+
+This operation can be extremely costly, especially with physics (because of the build reworld step).
+It is possible to disable this bahaviour on a per-prefab basis, by unackecking the `RollbackPredictionOnStructuralChanges` toggle in the GhostAuthoringComponent inspector.
+
+When the `RollbackPredictionOnStructuralChanges` is set to false, the GhostUpdateSystem will try to reuse the current backup if possible, preserving a lot of CPU cycle. This is in general a very good optimization that you would like to enable by default.
+
+However there are (at the moment) some race conditions and **differences in behaviour when a replicated component is removed from the ghost**. In that case, because the entity is not rollback, the value of this component when it is re-added to entity
+may vary and, depending on the timing, different scenario can happen.
+
+In particular, If a new update for this ghost is received, the snapshot data will contains the last value from the server. However, if the component is missing at that time, the value of the component will be not restored.
+When later, ther component is re-added, because the entity is not rollback and re-predicted, the current state of the re-added component is still `default` (all zeros).
+For comparison, if this optimization is off, because the entity is re-predicted, the value of the re-added component is restored correctly.
+
+If you know that none of the replicated component are removed for your ghost at runtime (removing others does not cause problem), it is strongly suggested to enable this optimzation, by disabling the default behaviour.

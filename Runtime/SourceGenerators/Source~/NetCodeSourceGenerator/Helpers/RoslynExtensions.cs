@@ -191,13 +191,22 @@ namespace Unity.NetCode.Roslyn
                 return true;
             }
 
-            if (interfaceQualifiedName == "Unity.NetCode.IRpcCommand")
+            if (interfaceQualifiedName == "Unity.NetCode.IRpcCommand" ||
+                interfaceSymbol.InheritsFromInterface("Unity.NetCode.IRpcCommand"))
             {
                 componentType = ComponentType.Rpc;
                 return true;
             }
 
-            if (interfaceQualifiedName == "Unity.NetCode.IInputComponentData")
+            if (interfaceQualifiedName == "Unity.NetCode.IApprovalRpcCommand" ||
+                interfaceSymbol.InheritsFromInterface("Unity.NetCode.IApprovalRpcCommand"))
+            {
+                componentType = ComponentType.Rpc;
+                return true;
+            }
+
+            if (interfaceQualifiedName == "Unity.NetCode.IInputComponentData" ||
+                interfaceSymbol.InheritsFromInterface("Unity.NetCode.IInputComponentData"))
             {
                 componentType = ComponentType.Input;
                 return true;
@@ -246,6 +255,15 @@ namespace Unity.NetCode.Roslyn
             {
                 return typeSymbol.AllInterfaces.Any(i =>
                     i.ToDisplayString(QualifiedTypeFormat) == interfaceName || i.InheritsFromInterface(interfaceName));
+            }
+        }
+
+        public static bool ImplementsGenericInterface(this ITypeSymbol typeSymbol, string interfaceName)
+        {
+            using (new Profiler.Auto("ImplementsGenericInterface"))
+            {
+                return typeSymbol.AllInterfaces.Any(i =>
+                    i.ToDisplayString(QualifiedTypeFormat).Equals($"{interfaceName}<{typeSymbol.GetFullTypeName()}>"));
             }
         }
 

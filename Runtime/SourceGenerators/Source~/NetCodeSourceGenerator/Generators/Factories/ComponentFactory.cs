@@ -29,6 +29,7 @@ namespace Unity.NetCode.Generators
         private static void GenerateComponents(IEnumerable<SyntaxNode> components, CodeGenerator.Context codeGenContext)
         {
             var typeBuilder = new TypeInformationBuilder(codeGenContext.diagnostic, codeGenContext.executionContext, TypeInformationBuilder.SerializationMode.Component);
+            var rootNamespace = codeGenContext.generatedNs;
             foreach (var componentCandidate in components)
             {
                 codeGenContext.executionContext.CancellationToken.ThrowIfCancellationRequested();
@@ -109,16 +110,20 @@ namespace Unity.NetCode.Generators
 
                 codeGenContext.diagnostic.LogInfo($"Generating ghost for {typeInfo.TypeFullName}");
                 codeGenContext.ResetState();
-                codeGenContext.generatorName = Roslyn.Extensions.GetTypeNameWithDeclaringTypename(candidateSymbol);
+                NameUtils.UpdateNameAndNamespace(ref typeInfo, rootNamespace, ref codeGenContext, ref candidateSymbol);
                 codeGenContext.types.Add(typeInfo);
                 CodeGenerator.GenerateGhost(codeGenContext, typeInfo);
             }
+            
+            codeGenContext.generatedNs = rootNamespace;
         }
 
         private static void GenerateVariants(IEnumerable<SyntaxNode> variants, CodeGenerator.Context codeGenContext)
         {
             var typeBuilder = new TypeInformationBuilder(codeGenContext.diagnostic, codeGenContext.executionContext,
                 TypeInformationBuilder.SerializationMode.Component);
+            var rootNamespace = codeGenContext.generatedNs;
+
             foreach (var componentCandidate in variants)
             {
                 codeGenContext.executionContext.CancellationToken.ThrowIfCancellationRequested();
@@ -181,11 +186,15 @@ namespace Unity.NetCode.Generators
                 codeGenContext.types.Add(variantTypeInfo);
                 codeGenContext.diagnostic.LogDebug($"Generating serializer for variant {variantSymbol.ToDisplayString()} for type {variantTypeInfo.TypeFullName}.");
                 codeGenContext.ResetState();
-                codeGenContext.generatorName = Roslyn.Extensions.GetTypeNameWithDeclaringTypename(variantSymbol);
+
+                NameUtils.UpdateNameAndNamespace(ref variantTypeInfo, rootNamespace, ref codeGenContext, ref variantSymbol);
+
                 codeGenContext.variantTypeFullName = Roslyn.Extensions.GetFullTypeName(variantSymbol);
                 codeGenContext.variantHash = variantHash;
                 CodeGenerator.GenerateGhost(codeGenContext, variantTypeInfo);
             }
+
+            codeGenContext.generatedNs = rootNamespace;
         }
 
         /// <summary>

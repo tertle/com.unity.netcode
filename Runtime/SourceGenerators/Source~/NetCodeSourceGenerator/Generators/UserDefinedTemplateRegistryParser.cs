@@ -21,7 +21,7 @@ namespace Unity.NetCode.Generators
         public static List<TypeRegistryEntry> ParseTemplates(GeneratorExecutionContext context, IDiagnosticReporter reporter)
         {
             var templates = new List<TypeRegistryEntry>();
-            //This is only true for NetCode assembly. All the other don't have any symbols (but only metedata refs)
+            //This is only true for NetCode assembly. All the other don't have any symbols (but only metadata refs)
             var symbol = context.Compilation.GetSymbolsWithName("UserDefinedTemplates").FirstOrDefault();
             if (symbol != null)
             {
@@ -177,4 +177,3 @@ namespace Unity.NetCode.Generators
         }
     }
 }
-

@@ -7,6 +7,7 @@ using Unity.Collections.LowLevel.Unsafe;
 using Unity.Entities;
 using Unity.Jobs;
 using Unity.Networking.Transport;
+using Unity.Networking.Transport.Utilities;
 
 namespace Unity.NetCode
 {
@@ -16,16 +17,16 @@ namespace Unity.NetCode
     public enum TransportType : int
     {
         /// <summary>
-        /// Not configured, or unsupported tramsport interface. The transport type for a registered driver instance
-        /// is always valid, unless the driver creation fail.
+        /// Not configured, or unsupported transport interface. The transport type for a registered driver instance
+        /// is always valid (not this value, in other words), unless the driver creation failed.
         /// </summary>
         Invalid = 0,
         /// <summary>
-        /// An inter-process like communication channel with 0 latency and guaratee delivery.
+        /// An inter-process like communication channel with zero latency, and guaranteed delivery.
         /// </summary>
         IPC,
         /// <summary>
-        /// A socket based communication channel. WebSocket, UDP, TCP or any similar communication channel fit that category.
+        /// A socket based communication channel. WebSocket, UDP, TCP or any similar communication channels fit that category.
         /// </summary>
         Socket,
     }
@@ -64,10 +65,11 @@ namespace Unity.NetCode
             /// </summary>
             public bool simulatorEnabled
             {
-                get { return m_simulatorEnabled == 1; }
-                set { m_simulatorEnabled = value ? (byte)1 : (byte)0; }
+                get => driver.IsCreated && driver.CurrentSettings.TryGet<SimulatorUtility.Parameters>(out _) || driver.CurrentSettings.TryGet<NetworkSimulatorParameter>(out _);
+                [Obsolete("This set has no effect on whether or not the simulator is actually enabled, and therefore should not be used.", false)]
+                // ReSharper disable once ValueParameterNotUsed
+                set { }
             }
-            private byte m_simulatorEnabled;
 
             internal void StopListening()
             {
@@ -81,7 +83,7 @@ namespace Unity.NetCode
         /// Struct that contains a the <see cref="NetworkDriver.Concurrent"/> version of the <see cref="NetworkDriver"/>
         /// and relative pipelines.
         /// </summary>
-        internal struct Concurrent
+        public struct Concurrent
         {
             /// <summary>
             /// The <see cref="NetworkDriver.Concurrent"/> version of the network driver.
@@ -115,10 +117,11 @@ namespace Unity.NetCode
             public bool IsCreated => instance.driver.IsCreated;
         }
 
-        private NetworkDriverData m_Driver0;
-        private NetworkDriverData m_Driver1;
-        private NetworkDriverData m_Driver2;
+        internal NetworkDriverData m_Driver0;
+        internal NetworkDriverData m_Driver1;
+        internal NetworkDriverData m_Driver2;
         private int m_numDrivers;
+        private int m_Finalized;
 
         /// <summary>
         /// The fixed capacity of the driver container.
@@ -129,7 +132,7 @@ namespace Unity.NetCode
         /// </summary>
         public const int FirstDriverId = 1;
         /// <summary>
-        /// The number of registed drivers. Must be always less then the total driver <see cref="Capacity"/>.
+        /// The number of registered drivers. Must be always less then the total driver <see cref="Capacity"/>.
         /// </summary>
         public int DriversCount => m_numDrivers;
         /// <summary>
@@ -165,42 +168,54 @@ namespace Unity.NetCode
             {
                 for (var i = FirstDriver; i <= LastDriver; ++i)
                 {
-                    var driverInstance = GetDriverInstance(i);
-                    if (driverInstance.simulatorEnabled) return true;
+                    if (GetDriverInstanceRO(i).simulatorEnabled)
+                        return true;
+                }
+
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Return true if there is at least one driver listening for incoming connections.
+        /// </summary>
+        public bool HasListeningInterfaces
+        {
+            get
+            {
+                for (var i = FirstDriver; i <= LastDriver; ++i)
+                {
+                    ref readonly var driverInstance = ref GetDriverInstanceRO(i);
+                    if (driverInstance.driver.IsCreated && driverInstance.driver.Listening)
+                        return true;
                 }
                 return false;
             }
         }
 
         /// <summary>
+        /// Denote if the store has at least one driver registered
+        /// </summary>
+        public bool IsCreated => m_numDrivers > 0 && m_Driver0.IsCreated;
+
+        /// <summary>
         /// Add a new driver to the store. Throw exception if all drivers slot are already occupied or the driver is not created/valid
         /// </summary>
         /// <returns>The assigned driver id </returns>
-        /// <param name="driverType"></param>
-        /// <param name="driverInstance"></param>
-        /// <exception cref="InvalidOperationException"></exception>
+        /// <param name="driverType">Driver type</param>
+        /// <param name="driverInstance">Instance of driver</param>
+        /// <exception cref="InvalidOperationException">Thrown if cannot register or the NetworkDriverStore is finalized.</exception>
         public int RegisterDriver(TransportType driverType, in NetworkDriverInstance driverInstance)
         {
             if (driverInstance.driver.IsCreated == false)
                 throw new InvalidOperationException("Cannot register non valid driver (IsCreated == false)");
             if (m_numDrivers == Capacity)
                 throw new InvalidOperationException("Cannot register more driver. All slot are already used");
-
+            if(m_Finalized != 0)
+                throw new InvalidOperationException("It is invalid to register a NetworkDriver instance to an already finalized NetworkDriverStore.\nIn order to register a new driver, you need to create a new NetworkDriverStore or invoke the RegisterNetworkDriver before the store instance is assigned to NetworkStreamDriver.");
             int nextDriverId = FirstDriverId + m_numDrivers;
             ++m_numDrivers;
-            ref var driverRef = ref m_Driver0;
-            switch (nextDriverId)
-            {
-                case 1:
-                    driverRef = ref m_Driver0;
-                    break;
-                case 2:
-                    driverRef = ref m_Driver1;
-                    break;
-                case 3:
-                    driverRef = ref m_Driver2;
-                    break;
-            }
+            ref var driverRef = ref GetDriverDataRW(nextDriverId);
             if (driverRef.IsCreated)
                 driverRef.Dispose();
             driverRef.transportType = driverType;
@@ -208,23 +223,15 @@ namespace Unity.NetCode
             return nextDriverId;
         }
 
-        /// <summary>
-        /// Reset the current state of the store and must be called before registering the drivers.
-        /// </summary>
-        internal void BeginDriverRegistration()
-        {
-            m_numDrivers = 0;
-            m_Driver0.Dispose();
-            m_Driver1.Dispose();
-            m_Driver2.Dispose();
-        }
 
         /// <summary>
         /// Finalize the registration phase by initializing all missing driver instances with a NullNetworkInterface.
         /// This final step is necessary to make the job safety system able to track all the safety handles.
         /// </summary>
-        internal void EndDriverRegistration()
+        internal void FinalizeDriverStore()
         {
+            if (m_Finalized != 0)
+                throw new InvalidOperationException("FinalizeDriverStore is called on already finalized NetworkDriverStore instance.");
             //The ifdef is to prevent allocating driver internal data when not necessary.
             //Allocating all drivers is necessary only in case safety handles are enabled.
 #if ENABLE_UNITY_COLLECTIONS_CHECKS
@@ -282,140 +289,130 @@ namespace Unity.NetCode
             m_Driver2.Dispose();
         }
 
-        ///<summary>
-        /// Return the <see cref="NetworkDriverInstance"/> instance with the given driverId.
+        /// <summary>
+        /// Returns the <see cref="NetworkDriverData"/> instance, by readonly ref.
         /// </summary>
-        /// <param name="driverId">the id of the driver. Should be always greater or equals than <see cref="FirstDriverId"/></param>
+        /// <param name="driverId">The index of the target driver. See <see cref="FirstDriver"/> and <see cref="LastDriver"/>.</param>
+        /// <returns>The <see cref="NetworkDriverData"/> instance, by readonly ref.</returns>
+        /// <exception cref="InvalidOperationException">Throws if driverId is out of range.</exception>
+        internal readonly unsafe ref NetworkDriverData GetDriverDataRO(int driverId)
+        {
+            fixed (NetworkDriverStore* store = &this)
+            {
+                switch (driverId)
+                {
+                    case 1: return ref store->m_Driver0;
+                    case 2: return ref store->m_Driver1;
+                    case 3: return ref store->m_Driver2;
+                    default:
+                        throw new InvalidOperationException($"Cannot find NetworkDriver with id {driverId}");
+                }
+            }
+        }
+        /// <summary>
+        /// Returns the <see cref="NetworkDriverData"/> instance, by ref.
+        /// </summary>
+        /// <inheritdoc cref="GetDriverDataRO"/>
+        internal unsafe ref NetworkDriverData GetDriverDataRW(int driverId)
+        {
+            fixed (NetworkDriverStore* store = &this)
+            {
+                switch (driverId)
+                {
+                    case 1: return ref store->m_Driver0;
+                    case 2: return ref store->m_Driver1;
+                    case 3: return ref store->m_Driver2;
+                    default:
+                        throw new InvalidOperationException($"Cannot find NetworkDriver with id {driverId}");
+                }
+            }
+        }
+
+        /// <summary>
+        /// Return the <see cref="NetworkDriverInstance"/> instance with the given <see cref="driverId"/>.
+        /// </summary>
         /// <remarks>
         /// The method return a copy of the driver instance not a reference. While this is suitable for almost all the use cases,
         /// since the driver is trivially copyable, be aware that calling some of the Driver class methods, like ScheduleUpdate,
         /// that update internal driver data (that aren't suited to be copied around) may not work as expected.
         /// </remarks>
-        /// <returns>The <see cref="NetworkDriverInstance"/> at for the given id.</returns>
-        /// <exception cref="InvalidOperationException">Throw an exception if a driver is not found</exception>
-        public readonly NetworkDriverInstance GetDriverInstance(int driverId)
-        {
-            switch (driverId)
-            {
-                case 1:
-                    return m_Driver0.instance;
-                case 2:
-                    return m_Driver1.instance;
-                case 3:
-                    return m_Driver2.instance;
-                default:
-                    throw new InvalidOperationException($"Cannot find NetworkDriver with id {driverId}");
-            }
-        }
+        /// <inheritdoc cref="GetDriverDataRO"/>
+        [Obsolete("Prefer GetDriverInstanceRW or GetDriverInstanceRO to avoid copying.", false)]
+        public readonly ref NetworkDriverInstance GetDriverInstance(int driverId) => ref GetDriverDataRO(driverId).instance;
 
         /// <summary>
-        /// Return the <see cref="NetworkDriver"/> with the given driver id.
+        /// Return the <see cref="NetworkDriver"/> with the given <see cref="driverId"/>.
         /// </summary>
-        /// <param name="driverId">the id of the driver. Should be always greater or equals than <see cref="FirstDriverId"/></param>
-        /// <returns>The <see cref="NetworkDriverInstance"/> at for the given id.</returns>
-        /// <exception cref="InvalidOperationException">Throw an exception if a driver is not found</exception>
-        public readonly NetworkDriver GetNetworkDriver(int driverId)
-        {
-            switch (driverId)
-            {
-                case 1:
-                    return m_Driver0.instance.driver;
-                case 2:
-                    return m_Driver1.instance.driver;
-                case 3:
-                    return m_Driver2.instance.driver;
-                default:
-                    throw new InvalidOperationException($"Cannot find NetworkDriver with id {driverId}");
-            }
-        }
+        /// <inheritdoc cref="GetDriverDataRO"/>
+        [Obsolete("Prefer GetDriverRW or GetDriverRO to avoid copying.", false)]
+        public readonly NetworkDriver GetNetworkDriver(int driverId) => GetDriverDataRO(driverId).instance.driver;
+
+        /// <summary>
+        ///  Return a reference to the <see cref="NetworkDriverStore.NetworkDriverInstance"/> instance with the given <see cref="driverId"/>.
+        ///  </summary>
+        /// <inheritdoc cref="GetDriverDataRO"/>
+        public ref NetworkDriverStore.NetworkDriverInstance GetDriverInstanceRW(int driverId) => ref GetDriverDataRW(driverId).instance;
+
+        /// <summary>
+        ///  Return a reference to the <see cref="NetworkDriverStore.NetworkDriverInstance"/> instance with the given <see cref="driverId"/>.
+        ///  </summary>
+        /// <inheritdoc cref="GetDriverDataRO"/>
+        public ref readonly NetworkDriverStore.NetworkDriverInstance GetDriverInstanceRO(int driverId) => ref GetDriverDataRO(driverId).instance;
+
+        /// <summary>
+        /// Retrieve a ReadWrite reference to the <see cref="NetworkDriver"/> for the given <see cref="driverId"/>.
+        /// </summary>
+        /// <inheritdoc cref="GetDriverDataRO"/>
+        public ref NetworkDriver GetDriverRW(int driverId) => ref GetDriverInstanceRW(driverId).driver;
+
+        /// <summary>
+        /// Retrieve a Read-Only reference to the <see cref="NetworkDriver"/> for the given <see cref="driverId"/>.
+        /// </summary>
+        /// <inheritdoc cref="GetDriverDataRO"/>
+        public ref readonly NetworkDriver GetDriverRO(int driverId) => ref GetDriverInstanceRO(driverId).driver;
 
         /// <summary>
         /// Return the transport type used by the registered driver.
         /// </summary>
-        /// <param name="driverId">the id of the driver. Should be always greater or equals than <see cref="FirstDriverId"/></param>
-        /// <returns>The <see cref="TransportType"/> of driver</returns>
-        /// <exception cref="InvalidOperationException">Throw an exception if a driver is not found</exception>
-        public TransportType GetDriverType(int driverId)
-        {
-            switch (driverId)
-            {
-                case 1:
-                    return m_Driver0.transportType;
-                case 2:
-                    return m_Driver1.transportType;
-                case 3:
-                    return m_Driver2.transportType;
-                default:
-                    throw new InvalidOperationException($"Cannot find NetworkDriver with id {driverId}");
-            }
-        }
+        /// <inheritdoc cref="GetDriverDataRO"/>
+        public TransportType GetDriverType(int driverId) => GetDriverDataRO(driverId).transportType;
 
         /// <summary>
         /// Return the state of the <see cref="NetworkStreamConnection"/> connection.
         /// </summary>
         /// <param name="connection">A client or server connection</param>
-        /// <returns></returns>
+        /// <returns>The state of the <see cref="NetworkStreamConnection"/> connection</returns>
         /// <exception cref="InvalidOperationException">Throw an exception if the driver associated to the connection is not found</exception>
-        public NetworkConnection.State GetConnectionState(NetworkStreamConnection connection)
-        {
-            ref var driverData = ref m_Driver0;
-            switch (connection.DriverId)
-            {
-                case 1:
-                    driverData = ref m_Driver0; break;
-                case 2:
-                    driverData = ref m_Driver1; break;
-                case 3:
-                    driverData = ref m_Driver2; break;
-                default:
-                    throw new InvalidOperationException($"Cannot find NetworkDriver with id {connection.DriverId}");
-            }
-            return connection.Value.GetState(driverData.instance.driver);
-        }
+        public NetworkConnection.State GetConnectionState(NetworkStreamConnection connection) => GetDriverRW(connection.DriverId).GetConnectionState(connection.Value);
 
         /// <summary>
         /// Signature for all functions that can be used to visit the registered drivers in the store using the <see cref="ForEachDriver"/> method.
-        /// <param name="driver">a reference to a <see cref="NetworkDriverInstance"/></param>
-        /// <param name="driverId">the id of the driver</param>
         /// </summary>
+        /// <param name="driver">a reference to a <see cref="NetworkDriverInstance"/></param>
+        /// <param name="driverId">the id of the driver. Must always greater or equals <see cref="NetworkDriverStore.FirstDriverId"/></param>
         public delegate void DriverVisitor(ref NetworkDriverInstance driver, int driverId);
 
         /// <summary>
         /// Invoke the delegate on all registered drivers.
         /// </summary>
-        /// <param name="visitor"></param>
+        /// <param name="visitor">Visitor to invoke with the driver instance and ID</param>
+        [Obsolete("The ForEachDriver has been deprecated. Please always iterate over the driver using a for loop, using the FirstDriver and LastDriver ids instead.")]
         public void ForEachDriver(DriverVisitor visitor)
         {
             if (m_numDrivers == 0)
                 return;
             visitor(ref m_Driver0.instance, FirstDriverId);
             if (m_numDrivers > 1)
-                visitor(ref m_Driver1.instance, FirstDriverId+1);
+                visitor(ref m_Driver1.instance, FirstDriverId + 1);
             if (m_numDrivers > 2)
-                visitor(ref m_Driver2.instance, FirstDriverId+2);
+                visitor(ref m_Driver2.instance, FirstDriverId + 2);
         }
 
         /// <summary>
         /// Utility method to disconnect the <see cref="NetworkStreamConnection" /> connection.
         /// </summary>
-        /// <param name="connection"></param>
-        /// <exception cref="InvalidOperationException"></exception>
-        public void Disconnect(NetworkStreamConnection connection)
-        {
-            ref var driverData = ref m_Driver0;
-            switch (connection.DriverId)
-            {
-                case 1:
-                    driverData = m_Driver0; break;
-                case 2:
-                    driverData = m_Driver1; break;
-                case 3:
-                    driverData = m_Driver2; break;
-                default:
-                    throw new InvalidOperationException($"Cannot find NetworkDriver with id {connection.DriverId}");
-            }
-            driverData.instance.driver.Disconnect(connection.Value);
-        }
+        /// <inheritdoc cref="GetDriverRW"/>
+        public void Disconnect(NetworkStreamConnection connection) => GetDriverRW(connection.DriverId).Disconnect(connection.Value);
 
         internal JobHandle ScheduleUpdateAllDrivers(JobHandle dependency)
         {
@@ -475,7 +472,7 @@ namespace Unity.NetCode
     /// <summary>
     /// The concurrent version of the DriverStore. Contains the concurrent copy of the drivers and relative pipelines.
     /// </summary>
-    internal struct ConcurrentDriverStore
+    public struct ConcurrentDriverStore
     {
         internal NetworkDriverStore.Concurrent m_Concurrent0;
         internal NetworkDriverStore.Concurrent m_Concurrent1;
@@ -485,8 +482,8 @@ namespace Unity.NetCode
         /// Get the concurrent driver with the given driver id
         /// </summary>
         /// <param name="driverId">the id of the driver. Must always greater or equals <see cref="NetworkDriverStore.FirstDriverId"/></param>
-        /// <returns></returns>
-        /// <exception cref="InvalidOperationException"></exception>
+        /// <returns>the concurrent version of the NetworkdDriverStore</returns>
+        /// <exception cref="InvalidOperationException">Throws if driverId is out of range.</exception>
         public NetworkDriverStore.Concurrent GetConcurrentDriver(int driverId)
         {
             switch (driverId)

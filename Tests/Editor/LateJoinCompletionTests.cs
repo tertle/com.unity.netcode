@@ -32,29 +32,28 @@ namespace Unity.NetCode.Tests
                 for (int i = 0; i < 8; ++i)
                     testWorld.SpawnOnServer(ghostGameObject);
 
-                float frameTime = 1.0f / 60.0f;
                 // Connect and make sure the connection could be established
-                testWorld.Connect(frameTime);
+                testWorld.Connect();
 
                 // Go in-game
                 testWorld.GoInGame();
 
                 // Let the game run for a bit so the ghosts are spawned on the client
                 for (int i = 0; i < 4; ++i)
-                    testWorld.Tick(frameTime);
+                    testWorld.Tick();
 
                 var ghostCount = testWorld.GetSingleton<GhostCount>(testWorld.ClientWorlds[0]);
                 // Validate that the ghost was deleted on the cliet
                 Assert.AreEqual(8, ghostCount.GhostCountOnServer);
-                Assert.AreEqual(8, ghostCount.GhostCountOnClient);
+                Assert.AreEqual(8, ghostCount.GhostCountReceivedOnClient);
 
                 // Spawn a few more and verify taht the count is updated
                 for (int i = 0; i < 8; ++i)
                     testWorld.SpawnOnServer(ghostGameObject);
                 for (int i = 0; i < 4; ++i)
-                    testWorld.Tick(frameTime);
+                    testWorld.Tick();
                 Assert.AreEqual(16, ghostCount.GhostCountOnServer);
-                Assert.AreEqual(16, ghostCount.GhostCountOnClient);
+                Assert.AreEqual(16, ghostCount.GhostCountReceivedOnClient);
             }
         }
         [Test]
@@ -71,9 +70,8 @@ namespace Unity.NetCode.Tests
 
                 testWorld.CreateWorlds(true, 1);
 
-                float frameTime = 1.0f / 60.0f;
                 // Connect and make sure the connection could be established
-                testWorld.Connect(frameTime);
+                testWorld.Connect();
 
                 for (int i = 0; i < 8; ++i)
                     testWorld.SpawnOnServer(ghostGameObject);
@@ -81,7 +79,7 @@ namespace Unity.NetCode.Tests
                 // Go in-game
                 testWorld.GoInGame();
 
-                testWorld.Tick(frameTime);
+                testWorld.Tick();
 
                 // Setup relevancy
                 ref var ghostRelevancy = ref testWorld.GetSingletonRW<GhostRelevancy>(testWorld.ServerWorld).ValueRW;
@@ -96,20 +94,20 @@ namespace Unity.NetCode.Tests
 
                 // Let the game run for a bit so the ghosts are spawned on the client
                 for (int i = 0; i < 4; ++i)
-                    testWorld.Tick(frameTime);
+                    testWorld.Tick();
 
                 var ghostCount = testWorld.GetSingleton<GhostCount>(testWorld.ClientWorlds[0]);
                 // Validate that the ghost was deleted on the cliet
                 Assert.AreEqual(6, ghostCount.GhostCountOnServer);
-                Assert.AreEqual(6, ghostCount.GhostCountOnClient);
+                Assert.AreEqual(6, ghostCount.GhostCountReceivedOnClient);
 
                 // Spawn a few more and verify taht the count is updated
                 for (int i = 0; i < 8; ++i)
                     testWorld.SpawnOnServer(ghostGameObject);
                 for (int i = 0; i < 4; ++i)
-                    testWorld.Tick(frameTime);
+                    testWorld.Tick();
                 Assert.AreEqual(6, ghostCount.GhostCountOnServer);
-                Assert.AreEqual(6, ghostCount.GhostCountOnClient);
+                Assert.AreEqual(6, ghostCount.GhostCountReceivedOnClient);
             }
         }
         [Test]
@@ -126,9 +124,8 @@ namespace Unity.NetCode.Tests
 
                 testWorld.CreateWorlds(true, 1);
 
-                float frameTime = 1.0f / 60.0f;
                 // Connect and make sure the connection could be established
-                testWorld.Connect(frameTime);
+                testWorld.Connect();
 
                 for (int i = 0; i < 8; ++i)
                     testWorld.SpawnOnServer(ghostGameObject);
@@ -136,7 +133,7 @@ namespace Unity.NetCode.Tests
                 // Go in-game
                 testWorld.GoInGame();
 
-                testWorld.Tick(frameTime);
+                testWorld.Tick();
 
                 // Setup relevancy
                 ref var ghostRelevancy = ref testWorld.GetSingletonRW<GhostRelevancy>(testWorld.ServerWorld).ValueRW;
@@ -151,20 +148,20 @@ namespace Unity.NetCode.Tests
 
                 // Let the game run for a bit so the ghosts are spawned on the client
                 for (int i = 0; i < 4; ++i)
-                    testWorld.Tick(frameTime);
+                    testWorld.Tick();
 
                 var ghostCount = testWorld.GetSingleton<GhostCount>(testWorld.ClientWorlds[0]);
                 // Validate that the ghost was deleted on the cliet
                 Assert.AreEqual(2, ghostCount.GhostCountOnServer);
-                Assert.AreEqual(2, ghostCount.GhostCountOnClient);
+                Assert.AreEqual(2, ghostCount.GhostCountReceivedOnClient);
 
                 // Spawn a few more and verify taht the count is updated
                 for (int i = 0; i < 8; ++i)
                     testWorld.SpawnOnServer(ghostGameObject);
                 for (int i = 0; i < 4; ++i)
-                    testWorld.Tick(frameTime);
+                    testWorld.Tick();
                 Assert.AreEqual(10, ghostCount.GhostCountOnServer);
-                Assert.AreEqual(10, ghostCount.GhostCountOnClient);
+                Assert.AreEqual(10, ghostCount.GhostCountReceivedOnClient);
             }
         }
     }

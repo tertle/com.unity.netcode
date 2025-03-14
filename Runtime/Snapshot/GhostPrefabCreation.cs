@@ -5,6 +5,8 @@
 using System;
 using Unity.Entities;
 using Unity.Collections;
+using Unity.Collections.LowLevel.Unsafe;
+using Unity.NetCode.LowLevel.Unsafe;
 
 /// <summary>
 /// Specify for which type of world the entity should be converted to. Based on the conversion setting, some components
@@ -29,10 +31,12 @@ public enum NetcodeConversionTarget
 namespace Unity.NetCode
 {
     /// <summary>
-    /// <para>Stores the `Supported Ghost Mode` by a ghost at authoring time.</para>
-    /// <para>- <b>Interpolated</b>: <inheritdoc cref="Interpolated"/></para>
-    /// <para>- <b>Predicted</b>: <inheritdoc cref="Predicted"/></para>
-    /// <para>- <b>All</b>: <inheritdoc cref="Predicted"/></para>
+    /// Stores the `Supported Ghost Mode` by a ghost at authoring time.
+    /// <list>
+    /// <item>Interpolated</item>
+    /// <item>Predicted</item>
+    /// <item>All</item>
+    /// </list>
     /// </summary>
     public enum GhostModeMask
     {
@@ -65,26 +69,26 @@ namespace Unity.NetCode
 
     /// <summary>
     /// The Current Ghost Mode of a Ghost, on any given client. Denotes replication and prediction rules.
-    /// <inheritdoc cref="GhostModeMask"/>
     /// </summary>
+    /// <inheritdoc cref="GhostModeMask"/>
     public enum GhostMode
     {
-        /// <summary><inheritdoc cref="GhostModeMask.Interpolated"/></summary>
+        /// <inheritdoc cref="GhostModeMask.Interpolated"/>
         Interpolated,
-        /// <summary><inheritdoc cref="GhostModeMask.Predicted"/></summary>
+        /// <inheritdoc cref="GhostModeMask.Predicted"/>
         Predicted,
         /// <summary>
         /// The ghost will be <see cref="Predicted"/> by the Ghost Owner (set via <see cref="GhostOwner"/>)
         /// and <see cref="Interpolated"/> by every other client.
         /// </summary>
-        OwnerPredicted
+        OwnerPredicted,
     }
 
     /// <summary>
     /// Specify if the ghost replication should be optimized for frequent (dynamic) or for infrequent (static) data changes.
-    ///  <para><inheritdoc cref="Dynamic"/></para>
-    ///  <para><inheritdoc cref="Static"/></para>
     /// </summary>
+    /// <inheritdoc cref="Dynamic"/>
+    /// <inheritdoc cref="Static"/>
     public enum GhostOptimizationMode
     {
         /// <summary>
@@ -119,9 +123,20 @@ namespace Unity.NetCode
             /// </summary>
             public FixedString64Bytes Name;
             /// <summary>
+            /// Optional UUID5 identifier used to unique determine the ghost type. By default that ghost type of the generated prefab
+            /// is calculated using the SHA1 hash of the mandatory <see cref="Name"/> property (combined with some unique GUID prefix).
+            /// If user provide a non-default ghost unique UUID5 guid the ghost will use that instead.
+            /// </summary>
+            public Hash128 UUID5GhostType;
+            /// <summary>
             /// Higher importance means the ghost will be sent more frequently if there is not enough bandwidth to send everything.
+            /// Minimum value: 1.
             /// </summary>
             public int Importance;
+            /// <summary>
+            /// Denotes the max send frequency of a ghost, similar to <see cref="GhostSendSystemData.MinSendImportance"/>.
+            /// </summary>
+            public byte MaxSendRate;
             /// <summary>
             /// The ghost modes this prefab can be instantiated as. If for example set the Interpolated it is not possible to use this prefab for prediction.
             /// </summary>
@@ -138,6 +153,20 @@ namespace Unity.NetCode
             /// Enable pre-serialization for this ghost. Pre-serialization makes it possible to share part of the serialization cpu cost between connections, but it also has that cost when the ghost is not sent.
             /// </summary>
             public bool UsePreSerialization;
+            /// <summary>
+            /// Enable predicted spawned ghost to rollback their initial spawn state and re-predict until the authoritative spawn has been received from the server.
+            /// </summary>
+            public bool PredictedSpawnedGhostRollbackToSpawnTick;
+            /// <summary>
+            /// Client CPU optimization. Force predicted ghost to always try to continue from the last prediction in case of structural changes. True by default (because may introduce some issue when replicated component are removed).
+            /// </summary>
+            public bool RollbackPredictionOnStructuralChanges;
+            /// <summary>
+            /// Optional, custom deterministic function that retrieve all no-backing and serializable component types for this ghost. By serializable,
+            /// we means components that either have ghost fields (fields with a <see cref="GhostFieldAttribute"/> attribute)
+            /// or a <see cref="GhostComponentAttribute"/>.
+            /// </summary>
+            public PortableFunctionPointer<GhostPrefabCustomSerializer.CollectComponentDelegate> CollectComponentFunc;
         }
         /// <summary>
         /// Identifier for a specific component type on a specific child of a ghost prefab.
@@ -155,8 +184,8 @@ namespace Unity.NetCode
             /// <summary>
             /// Compare two Component. Component are equals if the type and entity index are the same.
             /// </summary>
-            /// <param name="other"></param>
-            /// <returns></returns>
+            /// <param name="other">Component to compare</param>
+            /// <returns>Whether the type and entity index are the same</returns>
             public bool Equals(Component other)
             {
                 return ComponentType == other.ComponentType && ChildIndex == other.ChildIndex;
@@ -164,7 +193,7 @@ namespace Unity.NetCode
             /// <summary>
             /// Calculate a unique hash for the component based on type and index.
             /// </summary>
-            /// <returns></returns>
+            /// <returns>A unique hash based on the component type and index.</returns>
             public override int GetHashCode()
             {
                 return (ComponentType.GetHashCode() * 397) ^ ChildIndex.GetHashCode();
@@ -231,6 +260,29 @@ namespace Unity.NetCode
                 return 0;
             }
         }
+
+        /// <summary>
+        /// Convert a general <see cref="Hash128"/> to a proper UUID5 hash format by enforcing bits and version
+        /// to be set.
+        /// </summary>
+        /// <param name="hash128">the hash to convert to UUID5 format</param>
+        /// <returns>a new hash with the appropriate bytes set as specified by the RFC 4122</returns>
+        public static Hash128 ConvertHash128ToUUID5(Hash128 hash128)
+        {
+            return new Hash128(
+                hash128.Value.x,
+                (hash128.Value.y & (~0xf000u)) | 0x5000u, // Set version to 5
+                (hash128.Value.z & (0x3fffffffu)) | 0x80000000u, // Set upper bits to 1 and 0
+                hash128.Value.w);
+        }
+
+        private static bool ValidateIsUUID5(this ref GhostType ghostType)
+        {
+            //verify version is 5 and upper bits are 10
+            return (ghostType.guid1 & 0xf000u) == 0x5000 &&
+                   (ghostType.guid2 & 0xC0000000u) == 0x80000000;
+        }
+
         internal unsafe struct SHA1
         {
             private void UpdateABCDE(int i, ref uint a, ref uint b, ref uint c, ref uint d, ref uint e, uint f, uint k)
@@ -355,16 +407,10 @@ namespace Unity.NetCode
                 }
             }
 
-            public GhostType ToGhostType()
+            public Hash128 ToHash128()
             {
                 // Construct a guid, store it in the GhostType
-                return new GhostType
-                {
-                    guid0 = h0,
-                    guid1 = (h1 & (~0xf000u)) | 0x5000u, // Set version to 5
-                    guid2 = (h2 & (0x3fffffffu)) | 0x80000000u, // Set upper bits to 1 and 0
-                    guid3 = h3
-                };
+                return new Hash128(h0, h1, h2, h3);
             }
 
             private fixed uint words[80];
@@ -400,6 +446,7 @@ namespace Unity.NetCode
 
             // Store importance, supported modes, default mode and name in the meta data blob asset
             root.Importance = ghostConfig.Importance;
+            root.MaxSendRate = ghostConfig.MaxSendRate;
             root.SupportedModes = GhostPrefabBlobMetaData.GhostMode.Both;
             root.DefaultMode = GhostPrefabBlobMetaData.GhostMode.Interpolated;
             if (ghostConfig.SupportedGhostModes == GhostModeMask.Interpolated)
@@ -420,6 +467,16 @@ namespace Unity.NetCode
                 root.DefaultMode = GhostPrefabBlobMetaData.GhostMode.Predicted;
             }
             root.StaticOptimization = (ghostConfig.OptimizationMode == GhostOptimizationMode.Static);
+            if (root.SupportedModes != GhostPrefabBlobMetaData.GhostMode.Interpolated)
+            {
+                root.PredictedSpawnedGhostRollbackToSpawnTick = ghostConfig.PredictedSpawnedGhostRollbackToSpawnTick;
+                root.RollbackPredictionOnStructuralChanges = ghostConfig.RollbackPredictionOnStructuralChanges;
+            }
+            else
+            {
+                root.PredictedSpawnedGhostRollbackToSpawnTick = false;
+                root.RollbackPredictionOnStructuralChanges = false;
+            }
             builder.AllocateString(ref root.Name, ref ghostConfig.Name);
 
             var serverComponents = new NativeList<ulong>(allComponents.Length, Allocator.Temp);
@@ -798,18 +855,38 @@ namespace Unity.NetCode
             if (!overrides.IsCreated)
                 overrides = new NativeParallelHashMap<Component, ComponentOverride>(1, Allocator.Temp);
 
-            entityManager.AddComponent<Prefab>(prefab);
+#if !DOTS_DISABLE_DEBUG_NAMES
+            entityManager.GetName(prefab, out var name);
+            if(name.IsEmpty)
+                entityManager.SetName(prefab, config.Name);
+#endif
+
+            //the prefab tag must be added also to the child entities
             if (!entityManager.HasComponent<LinkedEntityGroup>(prefab))
             {
-                var linkedEntities = entityManager.AddBuffer<LinkedEntityGroup>(prefab);
-                linkedEntities.Add(prefab);
+                var buffer = entityManager.AddBuffer<LinkedEntityGroup>(prefab);
+                buffer.Add(prefab);
             }
             var linkedEntityBuffer = entityManager.GetBuffer<LinkedEntityGroup>(prefab);
             var linkedEntitiesArray = new NativeArray<Entity>(linkedEntityBuffer.Length, Allocator.Temp);
             for (int i = 0; i < linkedEntityBuffer.Length; ++i)
                 linkedEntitiesArray[i] = linkedEntityBuffer[i].Value;
+            //added here as second pass to avoid invalidating the buffer safety handle
+            for (int i = 0; i < linkedEntitiesArray.Length; ++i)
+                entityManager.AddComponent<Prefab>(linkedEntitiesArray[i]);
 
-            CollectAllComponents(entityManager, linkedEntitiesArray, out var allComponents, out var componentCounts);
+            var allComponents = default(NativeList<ComponentType>);
+            var componentCounts = default(NativeArray<int>);
+            if (!config.CollectComponentFunc.Ptr.IsCreated)
+            {
+                CollectAllComponents(entityManager, linkedEntitiesArray, out allComponents, out componentCounts);
+            }
+            else
+            {
+                allComponents = new NativeList<ComponentType>(256, Allocator.Temp);
+                componentCounts = new NativeArray<int>(linkedEntitiesArray.Length, Allocator.Temp);
+                config.CollectComponentFunc.Ptr.Invoke(GhostComponentSerializer.IntPtrCast(ref allComponents), GhostComponentSerializer.IntPtrCast(ref componentCounts));
+            }
 
             var prefabTypes = new NativeArray<GhostPrefabType>(allComponents.Length, Allocator.Temp);
             var sendMasksOverride = new NativeArray<int>(allComponents.Length, Allocator.Temp);
@@ -840,7 +917,7 @@ namespace Unity.NetCode
                 if (hasOverrides && (compOverride.OverrideType & ComponentOverrideType.Variant) != 0)
                     variant = compOverride.Variant;
 
-                var variantType = collectionData.GetCurrentSerializationStrategyForComponent(allComponents[i], variant, true);
+                var variantType = collectionData.GetCurrentSerializationStrategyForComponent(allComponents[i], variant, childIndex == 0);
                 prefabTypes[i] = variantType.PrefabType;
                 sendMasksOverride[i] = -1;
                 variants[i] = variantType.Hash;
@@ -856,10 +933,21 @@ namespace Unity.NetCode
             NetcodeConversionTarget target = (entityManager.World.IsServer()) ? NetcodeConversionTarget.Server : NetcodeConversionTarget.Client;
             // Calculate a uuid v5 using the guid of this .cs file as namespace and the prefab name as name. See rfc 4122 for more info on uuid5
             // TODO: should probably be the raw bytes from the namespace guid + name
-            var uuid5 = new SHA1($"f17641b8-279a-94b1-1b84-487e72d49ab5{config.Name}");
-            // I need an unique identifier and should not clash with any loaded prefab, use uuid5 with a namespace + ghost name
-            var ghostType = uuid5.ToGhostType();
-
+            GhostType ghostType;
+            if (config.UUID5GhostType != default)
+            {
+                ghostType = GhostType.FromHash128(config.UUID5GhostType);
+#if NETCODE_DEBUG || UNITY_EDITOR
+                if (!ghostType.ValidateIsUUID5())
+                    throw new InvalidOperationException($"The custom UUID5 ghost type {config.UUID5GhostType} is not a valid UUID5 compliant unique identifier. Please refer to https://datatracker.ietf.org/doc/html/rfc4122 for more details");
+#endif
+            }
+            else
+            {
+                var uuid5 = new SHA1($"f17641b8-279a-94b1-1b84-487e72d49ab5{config.Name}");
+                // I need an unique identifier and should not clash with any loaded prefab, use uuid5 with a namespace + ghost name
+                ghostType = GhostType.FromHash128(ConvertHash128ToUUID5(uuid5.ToHash128()));
+            }
             //This should be present only for prefabs. FinalizePrefabComponents is also called for not prefab entities so it should not
             //be added there.
             if(target != NetcodeConversionTarget.Server && config.SupportedGhostModes != GhostModeMask.Interpolated)

@@ -1,248 +1,89 @@
-#if UNITY_EDITOR && !NETCODE_NDEBUG
-#define NETCODE_DEBUG
-#endif
-
 #if USING_OBSOLETE_METHODS_VIA_INTERNALSVISIBLETO
 #pragma warning disable 0436
 #endif
-
+#if UNITY_EDITOR && !NETCODE_NDEBUG
+#define NETCODE_DEBUG
+#endif
 using System;
-using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
+using Unity.Burst.CompilerServices;
 using Unity.Collections;
-using Unity.Burst;
 using Unity.Entities;
+using Unity.NetCode.LowLevel.Unsafe;
+using Unity.Networking.Transport;
+#if USING_UNITY_LOGGING
 using Logger = Unity.Logging.Logger;
-
 using Unity.Logging;
 using Unity.Logging.Internal;
 using Unity.Logging.Sinks;
-
-#if NETCODE_DEBUG
-namespace Unity.NetCode.LowLevel.Unsafe
-{
-    internal partial struct NetDebugInterop
-    {
-        static class Managed
-        {
-            public static bool _initialized;
-            public delegate void _dlg_GetTimeStamp(out FixedString32Bytes timestamp);
-            public static object _gcDefeat_GetTimeStamp;
-
-            public delegate void _dlg_GetTimestampWithTick(NetworkTick serverTick, out FixedString128Bytes timestampAndTick);
-            public static object _gcDefeat_GetTimestampWithTick;
-
-            public delegate void _dlg_InitDebugPacketIfNotCreated(ref NetDebugPacket m_NetDebugPacket, ref FixedString512Bytes logFolder, ref FixedString128Bytes worldName, int connectionId);
-            public static object _gcDefeat_InitDebugPacketIfNotCreated;
-        }
-
-        struct TagType_InitDebugPacketIfNotCreated {}
-        public static readonly SharedStatic<IntPtr> _bfp_InitDebugPacketIfNotCreated = SharedStatic<IntPtr>.GetOrCreate<TagType_InitDebugPacketIfNotCreated>();
-
-        struct TagType_GetTimestamp {}
-        public static readonly SharedStatic<IntPtr> _bfp_GetTimestamp = SharedStatic<IntPtr>.GetOrCreate<TagType_GetTimestamp>();
-
-        struct TagType_GetTimestampWithTick {}
-        public static readonly SharedStatic<IntPtr> _bfp_GetTimestampWithTick = SharedStatic<IntPtr>.GetOrCreate<TagType_GetTimestampWithTick>();
-
-        public static void Initialize()
-        {
-            if (Managed._initialized) { return; }
-            Managed._initialized = true;
-
-            Managed._dlg_InitDebugPacketIfNotCreated delegateInitDebugPacket = _wrapper_InitDebugPacketIfNotCreated;
-            Managed._gcDefeat_InitDebugPacketIfNotCreated = delegateInitDebugPacket;
-            _bfp_InitDebugPacketIfNotCreated.Data = Marshal.GetFunctionPointerForDelegate(delegateInitDebugPacket);
-
-            Managed._dlg_GetTimeStamp delegateGetTimestamp = _wrapper_GetTimestamp;
-            Managed._gcDefeat_GetTimeStamp = delegateGetTimestamp;
-            _bfp_GetTimestamp.Data = Marshal.GetFunctionPointerForDelegate(delegateGetTimestamp);
-
-            Managed._dlg_GetTimestampWithTick delegateGetTimestampWithTick = _wrapper_GetTimestampWithTick;
-            Managed._gcDefeat_GetTimestampWithTick = delegateGetTimestampWithTick;
-            _bfp_GetTimestampWithTick.Data = Marshal.GetFunctionPointerForDelegate(delegateGetTimestampWithTick);
-        }
-
-        [AOT.MonoPInvokeCallback(typeof(Managed._dlg_InitDebugPacketIfNotCreated))]
-        private static void _wrapper_InitDebugPacketIfNotCreated(ref NetDebugPacket m_NetDebugPacket, ref FixedString512Bytes logFolder, ref FixedString128Bytes worldName, int connectionId)
-        {
-            _InitDebugPacketIfNotCreated(ref m_NetDebugPacket, ref logFolder, ref worldName, connectionId);
-        }
-
-        [AOT.MonoPInvokeCallback(typeof(Managed._dlg_GetTimeStamp))]
-        private static void _wrapper_GetTimestamp(out FixedString32Bytes timestamp)
-        {
-            _GetTimestamp(out timestamp);
-        }
-
-        [AOT.MonoPInvokeCallback(typeof(Managed._dlg_InitDebugPacketIfNotCreated))]
-        private static void _wrapper_GetTimestampWithTick(NetworkTick tick, out FixedString128Bytes timestampWithTick)
-        {
-            _GetTimestampWithTick(tick, out timestampWithTick);
-        }
-
-        public static void InitDebugPacketIfNotCreated(ref NetDebugPacket m_NetDebugPacket, ref FixedString512Bytes logFolder, ref FixedString128Bytes worldName, int connectionId)
-        {
-            if (BurstCompiler.IsEnabled)
-            {
-                CheckInteropClassInitialized(_bfp_InitDebugPacketIfNotCreated.Data);
-                var fp = new FunctionPointer<Managed._dlg_InitDebugPacketIfNotCreated>(_bfp_InitDebugPacketIfNotCreated.Data);
-                fp.Invoke(ref m_NetDebugPacket, ref logFolder, ref worldName, connectionId);
-                return;
-            }
-
-            _InitDebugPacketIfNotCreated(ref m_NetDebugPacket, ref logFolder, ref worldName, connectionId);
-        }
-
-        public static void GetTimestamp(out FixedString32Bytes timestamp)
-        {
-            if (BurstCompiler.IsEnabled)
-            {
-                CheckInteropClassInitialized(_bfp_GetTimestamp.Data);
-                var fp = new FunctionPointer<Managed._dlg_GetTimeStamp>(_bfp_GetTimestamp.Data);
-                fp.Invoke(out timestamp);
-                return;
-            }
-
-            _GetTimestamp(out timestamp);
-        }
-
-        public static void GetTimestampWithTick(NetworkTick serverTick, out FixedString128Bytes timestampWithTick)
-        {
-            if (BurstCompiler.IsEnabled)
-            {
-                CheckInteropClassInitialized(_bfp_GetTimestampWithTick.Data);
-                var fp = new FunctionPointer<Managed._dlg_GetTimestampWithTick>(_bfp_GetTimestampWithTick.Data);
-                fp.Invoke(serverTick, out timestampWithTick);
-                return;
-            }
-
-            _GetTimestampWithTick(serverTick, out timestampWithTick);
-        }
-
-        [Conditional("ENABLE_UNITY_COLLECTIONS_CHECKS")]
-        static void CheckInteropClassInitialized(IntPtr intPtr)
-        {
-            if (intPtr == IntPtr.Zero)
-            {
-                throw new InvalidOperationException("Burst Interop Classes must be initialized manually");
-            }
-        }
-    }
-
-    [GenerateBurstMonoInterop("NetDebugInterop")]
-    [BurstCompile]
-    internal partial struct NetDebugInterop
-    {
-        [BurstMonoInteropMethod]
-        [BurstDiscard]
-        private static void _InitDebugPacketIfNotCreated(ref NetDebugPacket netDebugPacket, ref FixedString512Bytes logFolder, ref FixedString128Bytes worldName, int connectionId)
-        {
-            if (!netDebugPacket.IsCreated)
-            {
-                netDebugPacket.Init(ref logFolder, ref worldName, connectionId);
-            }
-        }
-
-        [BurstMonoInteropMethod]
-        [BurstDiscard]
-        private static void _GetTimestamp(out FixedString32Bytes timestamp)
-        {
-            timestamp = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff", System.Globalization.CultureInfo.InvariantCulture);
-        }
-
-        [BurstMonoInteropMethod]
-        [BurstDiscard]
-        private static void _GetTimestampWithTick(NetworkTick predictedTick, out FixedString128Bytes timestampAndTick)
-        {
-            _GetTimestamp(out var timestamp);
-            if (predictedTick.IsValid)
-                timestampAndTick = FixedString.Format("[{0}][PredictedTick:{1}]", timestamp, (predictedTick.TickIndexForValidTick));
-            else
-                timestampAndTick = FixedString.Format("[{0}][PredictedTick:Invalid]", timestamp);
-        }
-    }
-
-    public struct NetDebugPacket
-    {
-        private LoggerHandle m_NetDebugPacketLoggerHandle;
-
-        public void Init(ref FixedString512Bytes logFolder, ref FixedString128Bytes worldName, int connectionId)
-        {
-            LogMemoryManagerParameters.GetDefaultParameters(out var parameters);
-            parameters.InitialBufferCapacity *= 64;
-            parameters.OverflowBufferSize *= 32;
-
-            var dateTime = DateTime.Now.ToString("yyyy-MM-dd--HH-mm-ss");
-            var fileName = $"{logFolder}/NetcodePackets-New-{worldName}-{connectionId}-{dateTime}.log";
-
-            var next = 0;
-            while (File.Exists(fileName))
-            {
-                fileName = $"{logFolder}/NetcodePackets-New-{worldName}-{connectionId}-{dateTime}-{next}.log";
-                next++;
-
-                if (next >= 100)
-                {
-                    break;
-                }
-            }
-
-            m_NetDebugPacketLoggerHandle = new LoggerConfig()
-                .OutputTemplate("{Message}")
-                .MinimumLevel.Set(LogLevel.Verbose)
-                .CaptureStacktrace(false)
-                .RedirectUnityLogs(false)
-                .WriteTo.File(fileName)
-                .CreateLogger(parameters).Handle;
-        }
-
-        public bool IsCreated => m_NetDebugPacketLoggerHandle.IsValid;
-
-        public void Log(in FixedString512Bytes msg)
-        {
-            Unity.Logging.Log.To(m_NetDebugPacketLoggerHandle).Info(msg);
-        }
-    }
-}
 #endif
 
 namespace Unity.NetCode
 {
     /// <summary>
-    /// Add this component to connection entities <see cref="NetworkStreamConnection"/> to get more detailed Netcode
-    /// debug information (`Debug` level) in general or to enable ghost snapshot or packet logging per connection.
-    /// Debug information can be toggled globally in the Playmode Tools Window and in the `NetCodeDebugConfigAuthoring` component.
+    /// Add this component to any connection entities (i.e. entities with the <see cref="NetworkStreamConnection"/> component)
+    /// to enable detailed netcode packet dump logging.
     /// </summary>
+    /// <remarks>
+    /// Packet dumps can be enabled for all connections globally via the Playmode Tools Window.
+    /// Alternatively, you can add the <see cref="NetCodeDebugConfig"/> to any sub-scene (via the `NetCodeDebugConfigAuthoring`)
+    /// and set the <see cref="NetCodeDebugConfig.DumpPackets"/> flag to true.
+    /// </remarks>
     public struct EnablePacketLogging : IComponentData
-    { }
+    {
+#if NETCODE_DEBUG
+        internal PacketDumpLogger NetDebugPacketCache;
+
+        /// <summary>
+        /// Check to ensure the packet cache is created, before use.
+        /// </summary>
+        public bool IsPacketCacheCreated => NetDebugPacketCache.IsCreated;
+
+        /// <summary>
+        /// Add your own custom logs to Netcode's per-connection packet dump.
+        /// </summary>
+        /// <remarks>For safety reasons, ensure you fetch this component with write access!</remarks>
+        /// <param name="msg">Message to append. Newlines are not automatically added!</param>
+        public void LogToPacket(in FixedString512Bytes msg)
+        {
+            if (!NetDebugPacketCache.IsCreated)
+                throw new InvalidOperationException("LogToPacket failed as cache has not been created yet! Wait for InitAndFetch to be called via netcode's GhostSend/ReceiveSystem.");
+            NetDebugPacketCache.Log(msg);
+        }
+#endif
 
 #if NETCODE_DEBUG
-    /// <summary>
-    /// The name of ghost prefab. Used for debugging purpose to pretty print ghost names. Available only once the
-    /// NETCODE_DEBUG define is set.
-    /// </summary>
-    public struct PrefabDebugName : IComponentData
-    {
-        public FixedString64Bytes Name;
-    }
+        /// <summary>
+        /// NetDebugPacket is a struct whose lifetime is maintained by other systems.
+        /// This method fetches whether or not it's enabled, and while doing so,
+        /// ensures the cache (<see cref="NetDebugPacketCache"/>) is setup.
+        /// </summary>
+        /// <param name="entity"></param>
+        /// <param name="lookup"></param>
+        /// <param name="netDebugPacket"></param>
+        /// <returns>1 if the entity has an EnablePacketLogging component.</returns>
+        /// <exception cref="InvalidOperationException"></exception>
+        internal static byte InitAndFetch(Entity entity, ComponentLookup<EnablePacketLogging> lookup, in PacketDumpLogger netDebugPacket)
+        {
+            var componentRef = lookup.GetRefRWOptional(entity);
+            if (!componentRef.IsValid)
+                return 0;
+            if (!netDebugPacket.IsCreated)
+                throw new InvalidOperationException("Packet logger has not been setup, InitAndFetch failed! Aborting.");
+            if (!componentRef.ValueRO.NetDebugPacketCache.IsCreated)
+                componentRef.ValueRW.NetDebugPacketCache = netDebugPacket;
+            return 1;
+        }
 #endif
+    }
 
     /// <summary>
     /// Convert disconnection reason error code into human readable error messages.
     /// </summary>
+    [Obsolete("Use ToFixedString extension methods. (RemovedAfter Entities 2.0)", false)]
     public struct DisconnectReasonEnumToString
     {
-        private static readonly FixedString32Bytes ConnectionClose = "ConnectionClose";
-        private static readonly FixedString32Bytes Timeout = "Timeout";
-        private static readonly FixedString32Bytes MaxConnectionAttempts = "MaxConnectionAttempts";
-        private static readonly FixedString32Bytes ClosedByRemote = "ClosedByRemote";
-        private static readonly FixedString32Bytes BadProtocolVersion = "BadProtocolVersion";
-        private static readonly FixedString32Bytes InvalidRpc = "InvalidRpc";
-        private static readonly FixedString32Bytes AuthenticationFailure = "AuthenticationFailure";
-        private static readonly FixedString32Bytes ProtocolError = "ProtocolError";
-
         /// <summary>
         /// Translate the error code into a human friendly error message.
         /// </summary>
@@ -252,24 +93,105 @@ namespace Unity.NetCode
         /// </returns>
         public static FixedString32Bytes Convert(int index)
         {
-            switch (index)
+            return ((NetworkStreamDisconnectReason) index).ToFixedString();
+        }
+    }
+
+    /// <summary>
+    /// ToFixedString utilities for enums.
+    /// </summary>
+    public static class NetCodeUtils
+    {
+        /// <summary>
+        /// Returns the Fixed String enum value name.
+        /// </summary>
+        /// <param name="reason">The source enum.</param>
+        /// <returns>Returns the Fixed String enum value name.</returns>
+        public static FixedString32Bytes ToFixedString(this NetworkStreamDisconnectReason reason)
+        {
+            switch (reason)
             {
-                case 0: return ConnectionClose;
-                case 1: return Timeout;
-                case 2: return MaxConnectionAttempts;
-                case 3: return ClosedByRemote;
-                case 4: return BadProtocolVersion;
-                case 5: return InvalidRpc;
-                case 6: return AuthenticationFailure;
-                case 7: return ProtocolError;
+                case NetworkStreamDisconnectReason.ConnectionClose: return nameof(NetworkStreamDisconnectReason.ConnectionClose);
+                case NetworkStreamDisconnectReason.Timeout: return nameof(NetworkStreamDisconnectReason.Timeout);
+                case NetworkStreamDisconnectReason.MaxConnectionAttempts: return nameof(NetworkStreamDisconnectReason.MaxConnectionAttempts);
+                case NetworkStreamDisconnectReason.ClosedByRemote: return nameof(NetworkStreamDisconnectReason.ClosedByRemote);
+                case NetworkStreamDisconnectReason.BadProtocolVersion: return nameof(NetworkStreamDisconnectReason.BadProtocolVersion);
+                case NetworkStreamDisconnectReason.InvalidRpc: return nameof(NetworkStreamDisconnectReason.InvalidRpc);
+                case NetworkStreamDisconnectReason.AuthenticationFailure: return nameof(NetworkStreamDisconnectReason.AuthenticationFailure);
+                case NetworkStreamDisconnectReason.ProtocolError: return nameof(NetworkStreamDisconnectReason.ProtocolError);
+                default: return $"DisconnectReason_{(int) reason}";
             }
-            return "";
+        }
+
+
+        // TODO: This is used all the time to set the connection state, so not really a NetDebug method
+        /// <summary>
+        /// Converts from the Transport state to ours.
+        /// </summary>
+        /// <param name="transportState">The source enum.</param>
+        /// <param name="hasHandshaked">True if the handshake process has been completed.</param>
+        /// <param name="hasApproval">True if (we have been approved AND the approval flow is enabled) OR if we don't need approval.</param>
+        /// <returns>Netcode connection state</returns>
+        /// <exception cref="ArgumentOutOfRangeException">If transport state is unknown.</exception>
+        public static ConnectionState.State ToNetcodeState(this NetworkConnection.State transportState, bool hasHandshaked, bool hasApproval = true)
+        {
+            switch (transportState)
+            {
+                // See docs.
+                case NetworkConnection.State.Connected:
+                    if (Hint.Likely(hasHandshaked && hasApproval))
+                        return ConnectionState.State.Connected;
+                    return hasHandshaked ? ConnectionState.State.Approval : ConnectionState.State.Handshake;
+                case NetworkConnection.State.Disconnected: return ConnectionState.State.Disconnected;
+                case NetworkConnection.State.Disconnecting: return ConnectionState.State.Disconnected;
+                case NetworkConnection.State.Connecting: return ConnectionState.State.Connecting;
+                default:
+                    throw new ArgumentOutOfRangeException(nameof(transportState), transportState, nameof(ToNetcodeState));
+            }
+        }
+
+        /// <summary>
+        /// Returns the Fixed String enum value name.
+        /// </summary>
+        /// <param name="state">The source enum.</param>
+        /// <returns>Returns the Fixed String enum value name.</returns>
+        public static FixedString32Bytes ToFixedString(this ConnectionState.State state)
+        {
+            switch (state)
+            {
+                case ConnectionState.State.Unknown: return nameof(ConnectionState.State.Unknown);
+                case ConnectionState.State.Disconnected: return nameof(ConnectionState.State.Disconnected);
+                case ConnectionState.State.Connecting: return nameof(ConnectionState.State.Connecting);
+                case ConnectionState.State.Handshake: return nameof(ConnectionState.State.Handshake);
+                case ConnectionState.State.Approval: return nameof(ConnectionState.State.Approval);
+                case ConnectionState.State.Connected: return nameof(ConnectionState.State.Connected);
+                default: return $"ConnectionState_{(int) state}";
+            }
+        }
+
+        /// <summary>
+        /// Returns the Fixed String enum value name.
+        /// </summary>
+        /// <param name="state">The source enum.</param>
+        /// <returns>Returns the Fixed String enum value name.</returns>
+        public static FixedString32Bytes ToFixedString(this NetworkConnection.State state)
+        {
+            switch (state)
+            {
+                case NetworkConnection.State.Disconnected: return nameof(NetworkConnection.State.Disconnected);
+                case NetworkConnection.State.Disconnecting: return nameof(NetworkConnection.State.Disconnecting);
+                case NetworkConnection.State.Connecting: return nameof(NetworkConnection.State.Connecting);
+                case NetworkConnection.State.Connected: return nameof(NetworkConnection.State.Connected);
+                default: return $"NetworkConnection.State_{(int) state}";
+            }
         }
     }
 
     /// <summary>Singleton handling NetCode logging and log management.</summary>
     public struct NetDebug : IComponentData
     {
+        internal const LogLevelType DefaultLogLevel = LogLevelType.Notify;
+
         /// <summary>
         /// Use this method to retrieve the platform specific folder where the NetCode logs files
         /// will be stored.
@@ -307,27 +229,12 @@ namespace Unity.NetCode
         private LogLevelType m_LogLevel;
 
 #if NETCODE_DEBUG
-        internal NativeParallelHashMap<int, FixedString128Bytes>.ReadOnly ComponentTypeNameLookup;
+        internal NativeHashMap<int, FixedString128Bytes>.ReadOnly ComponentTypeNameLookup;
 #endif
 
+#if USING_UNITY_LOGGING
         private LogLevel m_CurrentLogLevel;
         private LoggerHandle m_LoggerHandle;
-
-        private void SetLoggerLevel(LogLevelType newLevel)
-        {
-            m_CurrentLogLevel = newLevel switch
-            {
-                LogLevelType.Debug => Logging.LogLevel.Debug,
-                LogLevelType.Notify => Logging.LogLevel.Info,
-                LogLevelType.Warning => Logging.LogLevel.Warning,
-                LogLevelType.Error => Logging.LogLevel.Error,
-                LogLevelType.Exception => Logging.LogLevel.Fatal,
-                _ => throw new ArgumentOutOfRangeException()
-            };
-
-            var logger = GetOrCreateLogger();
-            logger.SetMinimalLogLevelAcrossAllSinks(m_CurrentLogLevel);
-        }
 
         private Logger GetOrCreateLogger()
         {
@@ -349,11 +256,34 @@ namespace Unity.NetCode
 
             return logger;
         }
+#endif
+        private void SetLoggerLevel(LogLevelType newLevel)
+        {
+#if USING_UNITY_LOGGING
+            m_CurrentLogLevel = newLevel switch
+            {
+                LogLevelType.Debug => Logging.LogLevel.Debug,
+                LogLevelType.Notify => Logging.LogLevel.Info,
+                LogLevelType.Warning => Logging.LogLevel.Warning,
+                LogLevelType.Error => Logging.LogLevel.Error,
+                LogLevelType.Exception => Logging.LogLevel.Fatal,
+                _ => throw new ArgumentOutOfRangeException()
+            };
 
+            var logger = GetOrCreateLogger();
+            logger.SetMinimalLogLevelAcrossAllSinks(m_CurrentLogLevel);
+#endif
+        }
         internal void Initialize()
         {
             MaxRpcAgeFrames = 4;
-            LogLevel = LogLevelType.Notify;
+            LogLevel = DefaultLogLevel;
+            // Suppressing by default because it leads to many test false positives.
+            SuppressApprovalRpcSentWhenApprovalFlowDisabledWarning = true;
+
+            WarnBatchedTicks = true;
+            WarnBatchedTicksRollingWindowSize = 4;
+            WarnAboveAverageBatchedTicksPerFrame = 1.2f;
         }
 
         /// <summary>
@@ -361,12 +291,14 @@ namespace Unity.NetCode
         /// </summary>
         public void Dispose()
         {
+#if USING_UNITY_LOGGING
             if (!m_LoggerHandle.IsValid)
                 return;
             var logger = LoggerManager.GetLogger(m_LoggerHandle);
             logger?.Dispose();
 
             m_LoggerHandle = default;
+#endif
         }
 
         /// <summary>
@@ -378,9 +310,20 @@ namespace Unity.NetCode
         /// Setting <see cref="SuppressApplicationRunInBackgroundWarning"/> to true will allow you to
         /// toggle off "Run in Background" without triggering the advice log.
         /// </remarks>
+        [field: MarshalAs(UnmanagedType.U1)]
         public bool SuppressApplicationRunInBackgroundWarning { get; set; }
 
+        /// <summary>
+        /// When debugging, it's helpful to treat 'sending an <see cref="IApprovalRpcCommand"/> RPC when approval is disabled' as a warning.
+        /// However, you may use approval RPCs to also send match join information, thus you may wish to suppress this warning.
+        /// Do so by setting this to true.
+        /// This log suppression is enabled by default! Set this flag to false to see the warning.
+        /// </summary>
+        [field: MarshalAs(UnmanagedType.U1)]
+        public bool SuppressApprovalRpcSentWhenApprovalFlowDisabledWarning { get; set; }
+
         /// <summary>Prevents log-spam for <see cref="SuppressApplicationRunInBackgroundWarning"/>.</summary>
+        [field: MarshalAs(UnmanagedType.U1)]
         internal bool HasWarnedAboutApplicationRunInBackground { get; set; }
 
         /// <summary>
@@ -391,9 +334,35 @@ namespace Unity.NetCode
         /// </summary>
         public ushort MaxRpcAgeFrames { get; set; }
 
+        // Frame time has exceeded the ability for fixed updates to 'catch up' to the simulation time, ticks will now be batched so instead of n ticks of fixedTimer per frame, we will have m ticks of  (n/m)*fixedTime per frame
+        // While this will allow the simulation to catch-up it will degrade interpolation performacne and can introduce predition errors since the server will simulate fewer frames than a client will predict and they may need to be adjusted.  This can be common in the editor and situations of poor performance.  With good interpolation and infrequent ocurrances this should have minimal visual impact.
+        // If its happening every frame you will observe severly degraded performance
+
+        /// <summary>
+        ///     Display a warning if ticks have been bacthed
+        /// </summary>
+        /// <remarks>
+        ///    Warning will be displayed when frame time has exceeded the ability for fixed updates to 'catch up' to the simulation time, ticks will be batched so instead of n ticks of fixedTimer per frame, we will have m ticks of  (n/m)*fixedTime per frame
+        ///    While this allows the simulation to catch-up it degrades interpolation performance and can introduce predition errors since the server will simulate fewer frames than a client will predict and they may need to be adjusted.  This can be common in the editor and situations of poor performance.  With good interpolation and infrequent ocurrances this should have minimal visual impact.
+        ///    If its happening every frame you will observe severly degraded performance
+        /// </remarks>
+        [field: MarshalAs(UnmanagedType.U1)]
+        public bool WarnBatchedTicks;
+
+        /// <summary>
+        ///     Size of the rolling window used to calculate the avergage for the number of frames which contained tick batching.
+        /// </summary>
+        public int WarnBatchedTicksRollingWindowSize;
+
+        /// <summary>
+        ///     Display a warning if the average number if ticks per frame is above this number
+        /// </summary>
+        public float WarnAboveAverageBatchedTicksPerFrame;
+
         /// <summary>
         /// The current debug logging level. Default value is <see cref="LogLevelType.Notify"/>.
         /// </summary>
+        [ExcludeFromBurstCompatTesting("may use managed objects")]
         public LogLevelType LogLevel
         {
             set
@@ -440,7 +409,12 @@ namespace Unity.NetCode
         /// <param name="msg">The ascii message string. Unicode are not supported</param>
         public readonly void DebugLog(in FixedString512Bytes msg)
         {
+#if USING_UNITY_LOGGING
             Unity.Logging.Log.To(m_LoggerHandle).Debug(msg);
+#else
+            if(m_LogLevel <= LogLevelType.Debug)
+                UnityEngine.Debug.Log(msg);
+#endif
         }
 
         /// <summary>
@@ -449,7 +423,12 @@ namespace Unity.NetCode
         /// <param name="msg">The ascii message string. Unicode are not supported</param>
         public readonly void Log(in FixedString512Bytes msg)
         {
+#if USING_UNITY_LOGGING
             Unity.Logging.Log.To(m_LoggerHandle).Info(msg);
+#else
+            if(m_LogLevel <= LogLevelType.Notify)
+                UnityEngine.Debug.Log(msg);
+#endif
         }
 
         /// <summary>
@@ -458,7 +437,12 @@ namespace Unity.NetCode
         /// <param name="msg">The ascii message string. Unicode are not supported</param>
         public readonly void LogWarning(in FixedString512Bytes msg)
         {
+#if USING_UNITY_LOGGING
             Unity.Logging.Log.To(m_LoggerHandle).Warning(msg);
+#else
+            if(m_LogLevel <= LogLevelType.Warning)
+                UnityEngine.Debug.LogWarning(msg);
+#endif
         }
 
         /// <summary>
@@ -467,7 +451,12 @@ namespace Unity.NetCode
         /// <param name="msg">The ascii message string. Unicode are not supported</param>
         public readonly void LogError(in FixedString512Bytes msg)
         {
+#if USING_UNITY_LOGGING
             Unity.Logging.Log.To(m_LoggerHandle).Error(msg);
+#else
+            if(m_LogLevel <= LogLevelType.Error)
+                UnityEngine.Debug.LogError(msg);
+#endif
         }
 
         /// <summary>
@@ -494,23 +483,6 @@ namespace Unity.NetCode
             if (maskString.Length == 0)
                 maskString = "0";
             return maskString;
-        }
-
-        /// <summary>
-        /// Method that print a human readable error message when the version protocol mismatch.
-        /// </summary>
-        /// <param name="error"></param>
-        /// <param name="protocolVersion"></param>
-        internal static void AppendProtocolVersionError(ref FixedString512Bytes error, NetworkProtocolVersion protocolVersion)
-        {
-            error.Append(FixedString.Format("NetCode={0} Game={1}", protocolVersion.NetCodeVersion,
-                protocolVersion.GameVersion));
-            FixedString32Bytes msg = " RpcCollection=";
-            error.Append(msg);
-            error.Append(protocolVersion.RpcCollectionVersion);
-            msg = " ComponentCollection=";
-            error.Append(msg);
-            error.Append(protocolVersion.ComponentCollectionVersion);
         }
 
         /// <summary>
@@ -545,7 +517,7 @@ namespace Unity.NetCode
         /// Print an unsigned integer in hexadecimal format
         /// </summary>
         /// <param name="value">The unsigned value to convert</param>
-        /// <returns></returns>
+        /// <returns>An unsigned integer in hexadecimal format</returns>
         public static FixedString32Bytes PrintHex(uint value)
         {
             return PrintHex(value, 32);
@@ -554,7 +526,7 @@ namespace Unity.NetCode
         /// Print a unsigned long integer in hexadecimal format
         /// </summary>
         /// <param name="value">The unsigned value to convert</param>
-        /// <returns></returns>
+        /// <returns>a unsigned long integer in hexadecimal format</returns>
         public static FixedString32Bytes PrintHex(ulong value)
         {
             return PrintHex(value, 64);

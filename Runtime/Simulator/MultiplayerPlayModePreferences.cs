@@ -1,14 +1,17 @@
 #if UNITY_EDITOR
 using System;
+using System.Collections.Generic;
+using Unity.Collections;
+using Unity.Entities;
 using Unity.Mathematics;
 using Unity.Networking.Transport;
 using Unity.Networking.Transport.Utilities;
+using Unity.Scenes;
 using UnityEditor;
 using UnityEngine;
 
 #if UNITY_USE_MULTIPLAYER_ROLES
 using Unity.Multiplayer;
-using Unity.Multiplayer.Editor;
 #endif
 
 namespace Unity.NetCode
@@ -47,6 +50,9 @@ namespace Unity.NetCode
         static string s_LoggerLevelType = s_PrefsKeyPrefix + "NetDebugLogger_LogLevelType";
         static string s_TargetShouldDumpPackets = s_PrefsKeyPrefix + "NetDebugLogger_ShouldDumpPackets";
         static string s_ShowAllSimulatorPresets = s_PrefsKeyPrefix + "ShowAllSimulatorPresets";
+        static string s_WarnBatchedTicks = s_PrefsKeyPrefix + "NetDebugLogger_WarnBacthedTicks";
+        static string s_WarnBatchedTicksRollingWindow = s_PrefsKeyPrefix + "NetDebugLogger_WarnBatchedTicksRollingWindow";
+        static string s_WarnAboveAverageTicksPerFrame = s_PrefsKeyPrefix + "NetDebugLogger_WarnAboveAverageTicksPerFrame";
 
         /// <summary>Stores whether or not the user wishes to use the client simulator UTP module.
         /// </summary>
@@ -76,7 +82,7 @@ namespace Unity.NetCode
         /// <inheritdoc cref="SimulatorUtility.Parameters"/>
         public static SimulatorUtility.Parameters ClientSimulatorParameters => new SimulatorUtility.Parameters
         {
-            Mode = ApplyMode.AllPackets, MaxPacketSize = NetworkParameterConstants.MTU, MaxPacketCount = k_DefaultSimulatorMaxPacketCount,
+            Mode = ApplyMode.AllPackets, MaxPacketSize = NetworkParameterConstants.MaxMessageSize, MaxPacketCount = k_DefaultSimulatorMaxPacketCount,
             PacketDelayMs = PacketDelayMs, PacketJitterMs = PacketJitterMs,
             PacketDropPercentage = PacketDropPercentage, FuzzFactor = PacketFuzzPercentage, PacketDuplicationPercentage = 0,
         };
@@ -119,9 +125,9 @@ namespace Unity.NetCode
             get
             {
 #if UNITY_USE_MULTIPLAYER_ROLES
-                if (Unity.Multiplayer.Editor.EditorMultiplayerManager.enableMultiplayerRoles)
+                if (Unity.Multiplayer.Editor.EditorMultiplayerRolesManager.EnableMultiplayerRoles)
                 {
-                    return MultiplayerRoleFlagsToPlayType(Unity.Multiplayer.Editor.EditorMultiplayerManager.activeMultiplayerRoleMask);
+                    return MultiplayerRoleFlagsToPlayType(Unity.Multiplayer.Editor.EditorMultiplayerRolesManager.ActiveMultiplayerRoleMask);
                 }
 #endif
                 return (ClientServerBootstrap.PlayType) EditorPrefs.GetInt(s_PlayModeTypeKey, (int) ClientServerBootstrap.PlayType.ClientAndServer);
@@ -129,9 +135,9 @@ namespace Unity.NetCode
             set
             {
 #if UNITY_USE_MULTIPLAYER_ROLES
-                if (Unity.Multiplayer.Editor.EditorMultiplayerManager.enableMultiplayerRoles)
+                if (Unity.Multiplayer.Editor.EditorMultiplayerRolesManager.EnableMultiplayerRoles)
                 {
-                    Unity.Multiplayer.Editor.EditorMultiplayerManager.activeMultiplayerRoleMask = PlayTypeToMultiplayerRoleFlags(value);
+                    Unity.Multiplayer.Editor.EditorMultiplayerRolesManager.ActiveMultiplayerRoleMask = PlayTypeToMultiplayerRoleFlags(value);
                     return;
                 }
 #endif
@@ -174,14 +180,20 @@ namespace Unity.NetCode
             set => EditorPrefs.SetInt(s_PacketFuzzPercentageKey, math.clamp(value, 0, 100));
         }
 
-        /// <summary>Denotes how many thin client worlds are created in the <see cref="ClientServerBootstrap"/> (and at runtime, the PlayMode window).</summary>
+        /// <summary>
+        /// Denotes how many thin client worlds are created in the editor (via the <see cref="AutomaticThinClientWorldsUtility"/> utility),
+        /// assuming that feature is enabled.
+        /// </summary>
         public static int RequestedNumThinClients
         {
             get => math.clamp(EditorPrefs.GetInt(s_RequestedNumThinClientsKey, 0), 0, ClientServerBootstrap.k_MaxNumThinClients);
             set => EditorPrefs.SetInt(s_RequestedNumThinClientsKey, math.clamp(value, 0, ClientServerBootstrap.k_MaxNumThinClients));
         }
 
-        /// <summary>How many thin client worlds to spawn per second. 0 implies spawn all at once.</summary>
+        /// <summary>
+        /// Denotes how many thin client worlds to spawn per second when in the editor (via the <see cref="AutomaticThinClientWorldsUtility"/> utility),
+        /// assuming that feature is enabled.
+        /// </summary>
         public static float ThinClientCreationFrequency
         {
             get => math.clamp(EditorPrefs.GetFloat(s_StaggerThinClientCreationKey, 2), 0f, 1_000);
@@ -224,6 +236,56 @@ namespace Unity.NetCode
             set => EditorPrefs.SetBool(s_ApplyLoggerSettings, value);
         }
 
+        /// <summary>If true, will force <see cref="NetDebugSystem"/> to display a warning when prediction ticks are batched.</summary>
+        public static bool WarnBatchedTicks
+        {
+            get => EditorPrefs.GetBool(s_WarnBatchedTicks, true);
+            set
+            {
+                EditorPrefs.SetBool(s_WarnBatchedTicks, value);
+
+                foreach (var serverWorld in ClientServerBootstrap.ServerWorlds)
+                {
+                    using var netDebugQuery = serverWorld.EntityManager.CreateEntityQuery(ComponentType.ReadWrite<NetDebug>());
+                    netDebugQuery.GetSingletonRW<NetDebug>().ValueRW.WarnBatchedTicks = value;
+                }
+            }
+        }
+
+        /// <summary>Specifies the number of frames the rolling average is calcualted over.</summary>
+        public static int WarnBatchedTicksRollingWindow
+        {
+            get => EditorPrefs.GetInt(s_WarnBatchedTicksRollingWindow, 4);
+            set
+            {
+                EditorPrefs.SetInt(s_WarnBatchedTicksRollingWindow, value);
+
+                foreach (var serverWorld in ClientServerBootstrap.ServerWorlds)
+                {
+                    using var netDebugQuery = serverWorld.EntityManager.CreateEntityQuery(ComponentType.ReadWrite<NetDebug>());
+                    netDebugQuery.GetSingletonRW<NetDebug>().ValueRW.WarnBatchedTicksRollingWindowSize = value;
+                }
+            }
+        }
+
+        /// <summary>If the average is above this percent a warning will be displayed. Set to 0 to always warn when ticks are batched.</summary>
+        public static float WarnAboveAverageBatchedTicksPerFrame
+        {
+            get => EditorPrefs.GetFloat(s_WarnAboveAverageTicksPerFrame, 1.2f);
+            set
+            {
+                EditorPrefs.SetFloat(s_WarnAboveAverageTicksPerFrame, value);
+
+                foreach (var serverWorld in ClientServerBootstrap.ServerWorlds)
+                {
+                    using var netDebugQuery = serverWorld.EntityManager.CreateEntityQuery(ComponentType.ReadWrite<NetDebug>());
+                    netDebugQuery.GetSingletonRW<NetDebug>().ValueRW.WarnAboveAverageBatchedTicksPerFrame = value;
+                }
+            }
+        }
+
+
+
         /// <summary>If <see cref="ApplyLoggerSettings"/>, forces all <see cref="NetDebugSystem"/> loggers to this log level.</summary>
         public static NetDebug.LogLevelType TargetLogLevel
         {
@@ -234,8 +296,20 @@ namespace Unity.NetCode
         /// <summary>If <see cref="ApplyLoggerSettings"/>, forces all <see cref="NetDebugSystem"/> loggers to have this value for ShouldDumpPackets.</summary>
         public static bool TargetShouldDumpPackets
         {
-            get => EditorPrefs.GetBool(s_TargetShouldDumpPackets, false);
-            set => EditorPrefs.SetBool(s_TargetShouldDumpPackets, value);
+            get
+            {
+#if NETCODE_NDEBUG
+                return false;
+#else
+                return EditorPrefs.GetBool(s_TargetShouldDumpPackets, false);
+#endif
+            }
+            set
+            {
+#if !NETCODE_NDEBUG // Prevent writing the above force-false.
+                EditorPrefs.SetBool(s_TargetShouldDumpPackets, value);
+#endif
+            }
         }
 
         /// <summary>If true, all simulator presets will be visible, rather than only platform specific ones.</summary>
@@ -248,7 +322,10 @@ namespace Unity.NetCode
         /// <summary>Returns true if the editor-inputted address is a valid connection address.</summary>
         public static bool IsEditorInputtedAddressValidForConnect(out NetworkEndpoint ep)
         {
-            if (AutoConnectionPort != 0 && NetworkEndpoint.TryParse(AutoConnectionAddress, AutoConnectionPort, out ep) && ep.IsValid && !ep.IsAny)
+            if (AutoConnectionPort != 0 && NetworkEndpoint.TryParse(AutoConnectionAddress, AutoConnectionPort, out ep, NetworkFamily.Ipv4) && !ep.IsAny)
+                return true;
+
+            if (AutoConnectionPort != 0 && NetworkEndpoint.TryParse(AutoConnectionAddress, AutoConnectionPort, out ep, NetworkFamily.Ipv6) && !ep.IsAny)
                 return true;
 
             ep = default;
@@ -273,10 +350,10 @@ namespace Unity.NetCode
     /// <summary>For the PlayMode Tools Window.</summary>
     public enum SimulatorView
     {
-        [Obsolete("RemovedAfter Entities 1.0")]
-        Disabled = -1,
-        PingView = 0,
-        PerPacketView = 1,
+        [Obsolete("Disabled is no longer supported. Use MultiplayerPlayModePreferences.SimulatorEnabled instead. RemovedAfter Entities 1.x")]
+        Disabled = 0,
+        PingView = 1,
+        PerPacketView = 2,
     }
 }
 #endif

@@ -3,6 +3,8 @@ using Unity.Collections;
 using Unity.Entities;
 using UnityEngine;
 using Unity.Entities.Hybrid.Baking;
+using Unity.NetCode.Hybrid;
+using UnityEngine.Serialization;
 
 namespace Unity.NetCode
 {
@@ -12,8 +14,8 @@ namespace Unity.NetCode
     /// <para>It allows setting all ghost properties,
     /// such as the replication mode <see cref="SupportedGhostModes"/>, bandwidth optimization strategy (<see cref="OptimizationMode"/>,
     /// the ghost <see cref="Importance"/> (how frequently is sent) and others).</para>
-    /// <seealso cref="GhostAuthoringInspectionComponent"/>
     /// </summary>
+    /// <seealso cref="GhostAuthoringInspectionComponent"/>
     [RequireComponent(typeof(LinkedEntityGroupAuthoring))]
     [DisallowMultipleComponent]
     [HelpURL(Authoring.HelpURLs.GhostAuthoringComponent)]
@@ -62,8 +64,31 @@ namespace Unity.NetCode
         /// <summary>
         /// If not all ghosts can fit in a snapshot only the most important ghosts will be sent. Higher importance means the ghost is more likely to be sent.
         /// </summary>
-        [Tooltip("Importance determines which ghosts are selected to be added to the snapshot, in the case where there is not enough space to include all ghosts in the snapshot. Many caveats apply, but generally, higher values are sent more frequently.\n\n<i>Example: A 'Player' ghost with an Importance of 100 is roughly 100x more likely to be sent in any given snapshot than a 'Barrel' ghost with an Importance of 1. In other words, expect the 'Player' ghost to have been replicated 100 times for every one time the 'Barrel' is replicated.</i>\n\nApplied at the chunk level.")]
+        [Tooltip(@"<b>Importance</b> determines how ghost chunks are prioritized against each other when working out what to send in the upcoming snapshot. Higher values are sent more frequently. Applied at the chunk level.
+<i>Simplified example: When comparing a gameplay-critical <b>Player</b> ghost with an <b>Importance</b> of 100 to a cosmetic <b>Cone</b> ghost with an <b>Importance</b> of 1, the <b>Player</b> ghost will likely be sent 100 times for every 1 time the <b>Cone</b> will be.</i>")]
+        [Min(1)]
         public int Importance = 1;
+
+        /// <summary>
+        ///     The theoretical maximum send frequency (in Hz) for ghost chunks of this ghost prefab type (excluding a few nuanced exceptions).
+        ///     Important Note: The MaxSendRate only denotes the maximum possible replication frequency, and cannot be enforced in all cases.
+        ///     Other factors (like <see cref="ClientServerTickRate.NetworkTickRate"/>, ghost instance count, <see cref="Importance"/>,
+        ///     Importance-Scaling, <see cref="GhostSendSystemData.DefaultSnapshotPacketSize"/>, and structural changes etc.)
+        ///     will determine the final/live send rate.
+        /// </summary>
+        /// <remarks>
+        /// Use this to brute-force reduce the bandwidth consumption of your most impactful ghost types.
+        /// Note: Predicted ghosts are particularly impacted by this, as a lower value here reduces rollback and re-simulation frequency
+        /// (as we only rollback and re-simulate a predicted ghost after it is received), which can save client CPU cycles in aggregate.
+        /// However, it may cause larger client misprediction errors, which leads to larger corrections.
+        /// </remarks>
+        [Tooltip(@"The <b>theoretical</b> maximum send frequency (in <b>Hertz</b>) for ghost chunks of this ghost prefab type.
+
+<b>Important Note:</b> The <b>MaxSendRate</b> only denotes the maximum possible replication frequency. Other factors (like <b>NetworkTickRate</b>, ghost instance count, <b>Importance</b>, <b>Importance-Scaling</b>, <b>DefaultSnapshotPacketSize</b> etc.) will determine the live send rate.
+
+<i>Use this to brute-force reduce the bandwidth consumption of your most impactful ghost types.</i>")]
+        public byte MaxSendRate;
+
         /// <summary>
         /// For internal use only, the prefab GUID used to distinguish between different variant of the same prefab.
         /// </summary>
@@ -75,10 +100,11 @@ namespace Unity.NetCode
         [Tooltip("Automatically adds a `GhostOwner`, which allows the server to set (and track) which connection owns this ghost. In your server code, you must set the `GhostOwner` to a valid `NetworkId.Value` at runtime.")]
         public bool HasOwner;
         /// <summary>
-        /// Automatically send all ICommandData buffers if the ghost is owned by the current connection,
-        /// AutoCommandTarget.Enabled is true and the ghost is predicted.
+        /// Automatically adds the <see cref="AutoCommandTarget"/> component to your ghost prefab,
+        /// which enables the "Auto Command Target" feature, which automatically sends all `ICommandData` and `IInputComponentData`
+        /// buffers to the server (assuming the ghost is owned by the current connection, and `AutoCommandTarget.Enabled` is true).
         /// </summary>
-        [Tooltip("Automatically sends all `ICommandData` buffers when the following conditions are met: \n\n - The ghost is owned by the current connection.\n\n - AutoCommandTarget is added, and Enabled is true.\n\n - The ghost is predicted.")]
+        [Tooltip("Enables the \"Auto Command Target\" feature, which automatically sends all `ICommandData` and `IInputComponentData` auto-generated buffers to the server if the following conditions are met: \n\n - The ghost is owned by the current connection (handled by user-code).\n\n - The `AutoCommandTarget` component is added to the ghost entity (enabled by this checkbox), and it's `[GhostField] public bool Enabled;` field is true (the default value).\n\nSupports both predicted and interpolated ghosts.")]
         public bool SupportAutoCommandTarget = true;
         /// <summary>
         /// Add a CommandDataInterpolationDelay component so the interpolation delay of each client is tracked.
@@ -101,6 +127,32 @@ namespace Unity.NetCode
         [Tooltip("CPU optimization that forces this ghost to be quantized and copied to the snapshot format <b>once for all connections</b> (instead of once <b>per connection</b>). This can save CPU time in the `GhostSendSystem` assuming all of the following:\n\n - The ghost contains many serialized components, serialized components on child entities, or serialized buffers.\n\n - The ghost is almost always sent to at least one connection.\n\n<i>Example use-cases: Players, important gameplay items like footballs and crowns, global entities like map settings and dynamic weather conditions.</i>")]
         public bool UsePreSerialization;
         /// <summary>
+        /// <para>
+        /// Only for client, force <i>predicted spawn ghost</i> of this type to rollback and re-predict their state from the tick client spawned them until
+        /// the authoritative server spawn has been received and classified. In order to save some CPU, the ghost state is rollback only in case a
+        /// new snapshot has been received, and it contains new predicted ghost data for this or other ghosts.
+        /// </para>
+        /// <para>
+        /// By default this option is set to false, meaning that predicted spawned ghost by the client never rollback their original state and re-predict
+        /// until the authoritative data is received. This behaviour is usually fine in many situation and it is cheaper in term of CPU.
+        /// </para>
+        /// </summary>
+        [Tooltip("Only for client, force <i>predicted spawn ghost</i> of this type to rollback and re-predict their state from their spawn tick until the authoritative server spawn has been received and classified. In order to save some CPU, the ghost state is rollback only in case a new snapshot has been received, and it contains new predicted ghost data for this or other ghosts.\nBy default this option is set to false, meaning that predicted spawned ghost by the client never rollback their original state and re-predict until the authoritative data is received. This behaviour is usually fine in many situation and it is cheaper in term of CPU.")]
+        public bool RollbackPredictedSpawnedGhostState;
+        /// <summary>
+        /// <para>
+        /// Client CPU optimization, force <i>predicted ghost</i> of this type to replay and re-predict their state from the last received snapshot tick in case of a structural change
+        /// or in general when an entry for the entity cannot be found in the prediction backup (see <see cref="GhostPredictionHistorySystem"/>).
+        /// </para>
+        /// <para>
+        /// By default this option is set to true, to preserve the original 1.0 behavior. Once the optimization is turned on, removing or adding replicated components from the predicted ghost on the client may cause issue on the restored value. Please check the documentation, in particular the Prediction edge case and known issue.
+        /// </para>
+        /// </summary>
+        [Tooltip("Client CPU optimization, force <i>predicted ghost</i> of this type to replay and re-predict their state from the last received snapshot tick in case of a structural change or in general when an entry for the entity cannot be found in the prediction backup.\nBy default this option is set to true, to preserve the original 1.0 behavior. Once the optimization is turned on, removing or adding replicated components from the predicted ghost on the client may cause some issue in regard the restored value when the component is re-added. Please check the documentation for more details, in particular the <i>Prediction edge case and known issue</i> section.")]
+        public bool RollbackPredictionOnStructuralChanges = true;
+
+
+        /// <summary>
         /// Validate the name of the GameObject prefab.
         /// </summary>
         /// <param name="ghostNameHash">Outputs the hash generated from the name.</param>
@@ -117,5 +169,24 @@ namespace Unity.NetCode
         }
         /// <summary>True if we can apply the <see cref="GhostSendType"/> optimization on this Ghost.</summary>
         public bool SupportsSendTypeOptimization => SupportedGhostModes != GhostModeMask.All || DefaultGhostMode == GhostMode.OwnerPredicted;
+
+        /// <summary>Helper.</summary>
+        /// <param name="ghostName"></param>
+        /// <returns></returns>
+        internal GhostPrefabCreation.Config AsConfig(FixedString64Bytes ghostName)
+        {
+            return new GhostPrefabCreation.Config
+            {
+                Name = ghostName,
+                Importance = Importance,
+                MaxSendRate = MaxSendRate,
+                SupportedGhostModes = SupportedGhostModes,
+                DefaultGhostMode = DefaultGhostMode,
+                OptimizationMode = OptimizationMode,
+                UsePreSerialization = UsePreSerialization,
+                PredictedSpawnedGhostRollbackToSpawnTick = RollbackPredictedSpawnedGhostState,
+                RollbackPredictionOnStructuralChanges = RollbackPredictionOnStructuralChanges,
+            };
+        }
     }
 }

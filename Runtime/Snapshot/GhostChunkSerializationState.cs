@@ -15,6 +15,9 @@ namespace Unity.NetCode.LowLevel.Unsafe
     {
         public ulong sequenceNumber;
         public int ghostType;
+        // Cached here for perf.
+        public ushort baseImportance;
+        public ushort maxSendRateAsSimTickInterval;
 
         // the entity and data arrays are 2d arrays (chunk capacity * max snapshots)
         // Find baseline by finding the largest tick not at writeIndex which has been acked by the other end
@@ -395,31 +398,32 @@ namespace Unity.NetCode.LowLevel.Unsafe
 
         public void Dispose()
         {
-            var oldChunks = SerializationState.GetKeyArray(Allocator.Temp);
-            for (int i = 0; i < oldChunks.Length; ++i)
-            {
-                GhostChunkSerializationState state;
-                SerializationState.TryGetValue(oldChunks[i], out state);
-                state.FreeSnapshotData();
-            }
-
-            SerializationState.Dispose();
+            var chunkStates = SerializationState->GetValueArray(Allocator.Temp);
+            for (int i = 0; i < chunkStates.Length; ++i)
+                chunkStates[i].FreeSnapshotData();
+            SerializationState->Dispose();
+            AllocatorManager.Free(Allocator.Persistent, SerializationState);
             ClearHistory.Dispose();
             AckedPrespawnSceneMap.Dispose();
             UnsafeList<PrespawnHelper.GhostIdInterval>.Destroy(m_NewLoadedPrespawnRanges);
             GhostStateData.Dispose();
+#if NETCODE_DEBUG
+            NetDebugPacket.Dispose();
+#endif
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         static public ConnectionStateData Create(Entity connection)
         {
+            var hashMapData = AllocatorManager.Allocate<UnsafeHashMap<ArchetypeChunk, GhostChunkSerializationState>>(Allocator.Persistent);
+            *hashMapData = new UnsafeHashMap<ArchetypeChunk, GhostChunkSerializationState>(1024, Allocator.Persistent);
             return new ConnectionStateData
             {
                 Entity = connection,
-                SerializationState = new UnsafeParallelHashMap<ArchetypeChunk, GhostChunkSerializationState>(1024, Allocator.Persistent),
+                SerializationState = hashMapData,
                 ClearHistory = new UnsafeParallelHashMap<int, NetworkTick>(256, Allocator.Persistent),
 #if NETCODE_DEBUG
-                NetDebugPacket = new NetDebugPacket(),
+                NetDebugPacket = new PacketDumpLogger(),
 #endif
                 GhostStateData = new GhostStateList(1024, 1024, Allocator.Persistent),
                 AckedPrespawnSceneMap = new UnsafeParallelHashMap<ulong, int>(256, Allocator.Persistent),
@@ -428,12 +432,11 @@ namespace Unity.NetCode.LowLevel.Unsafe
         }
 
         public Entity Entity;
-        public UnsafeParallelHashMap<ArchetypeChunk, GhostChunkSerializationState> SerializationState;
+        public UnsafeHashMap<ArchetypeChunk, GhostChunkSerializationState>* SerializationState;
         public UnsafeParallelHashMap<int, NetworkTick> ClearHistory;
 #if NETCODE_DEBUG
-        public NetDebugPacket NetDebugPacket;
+        public PacketDumpLogger NetDebugPacket;
 #endif
-
         public GhostStateList GhostStateData;
         public UnsafeParallelHashMap<ulong, int> AckedPrespawnSceneMap;
         public ref UnsafeList<PrespawnHelper.GhostIdInterval> NewLoadedPrespawnRanges => ref m_NewLoadedPrespawnRanges[0];

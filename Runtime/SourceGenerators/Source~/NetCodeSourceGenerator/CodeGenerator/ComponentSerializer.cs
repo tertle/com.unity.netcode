@@ -14,7 +14,7 @@ namespace Unity.NetCode.Generators
     internal class ComponentSerializer
     {
         private readonly TypeInformation m_TypeInformation;
-        private GhostCodeGen m_TargetGenerator;
+        public GhostCodeGen m_TargetGenerator;
         private GhostCodeGen m_ActiveGenerator;
         private readonly TypeTemplate m_Template;
         //The Regex is immutable and threadsafe. The match collection can be used by a single thread only
@@ -32,6 +32,7 @@ namespace Unity.NetCode.Generators
         {
             // fragment + alernative fragment in case of interpolation
             {"GHOST_FIELD", "GHOST_FIELD"},
+			{"GHOST_AGGREGATE_WRITE", "GHOST_AGGREGATE_WRITE"},
             {"GHOST_COPY_TO_SNAPSHOT", "GHOST_COPY_TO_SNAPSHOT"},
             {"GHOST_COPY_FROM_SNAPSHOT", "GHOST_COPY_FROM_SNAPSHOT_INTERPOLATE"},
             {"GHOST_RESTORE_FROM_BACKUP", "GHOST_RESTORE_FROM_BACKUP"},
@@ -249,8 +250,10 @@ namespace Unity.NetCode.Generators
 
             if (curChangeMaskBit == 32)
             {
-                generator.Replacements.Add("GHOST_CHANGE_MASK_BITS", curChangeMaskBit.ToString());
+                generator.Replacements.Add("GHOST_CURRENT_MASK_BITS", (context.changeMaskBitCount - curChangeMaskBit).ToString());
+                generator.Replacements.Add("GHOST_CHANGE_MASK_BITS", context.changeMaskBitCount.ToString());
                 target.GenerateFragment("GHOST_FLUSH_COMPONENT_CHANGE_MASK", generator.Replacements, target, "GHOST_CALCULATE_CHANGE_MASK");
+                target.GenerateFragment("GHOST_FLUSH_COMPONENT_CHANGE_MASK", generator.Replacements, target, "GHOST_WRITE_COMBINED");
                 target.GenerateFragment("GHOST_REFRESH_CHANGE_MASK", generator.Replacements, target, "GHOST_READ");
                 target.GenerateFragment("GHOST_REFRESH_CHANGE_MASK", generator.Replacements, target, "GHOST_WRITE");
                 curChangeMaskBit = 0;
@@ -258,11 +261,21 @@ namespace Unity.NetCode.Generators
             context.curChangeMaskBits = curChangeMaskBit;
             generator.Replacements.Add("GHOST_MASK_INDEX", curChangeMaskBit.ToString());
             if (curChangeMaskBit == 0 && (!aggregateMask || fieldIndex == 0))
+            {
                 generator.GenerateFragment(changeMaskFragZero, generator.Replacements, target, "GHOST_CALCULATE_CHANGE_MASK");
+                generator.GenerateFragment(changeMaskFragZero, generator.Replacements, target, "GHOST_WRITE_COMBINED");
+            }
             else
+            {
                 generator.GenerateFragment(changeMaskFrag, generator.Replacements, target, "GHOST_CALCULATE_CHANGE_MASK");
+                generator.GenerateFragment(changeMaskFrag, generator.Replacements, target, "GHOST_WRITE_COMBINED");
+            }
             // Serialize
             generator.GenerateFragment(ghostWriteFrag, generator.Replacements, target, "GHOST_WRITE");
+            if(!aggregateMask)
+                generator.GenerateFragment(ghostWriteFrag, generator.Replacements, target, "GHOST_WRITE_COMBINED");
+            else
+                generator.GenerateFragment(ghostWriteFrag, generator.Replacements, target, "GHOST_AGGREGATE_WRITE");
             // Deserialize
             generator.GenerateFragment(ghostReadFrag, generator.Replacements, target, "GHOST_READ");
         }
@@ -303,10 +316,19 @@ namespace Unity.NetCode.Generators
             {
                 m_TargetGenerator.GenerateFragment("GHOST_COMPONENT_IS_BUFFER", replacements);
             }
-            if (context.curChangeMaskBits > 0)
+            if (context.changeMaskBitCount > 0)
             {
-                replacements.Add("GHOST_CHANGE_MASK_BITS", context.curChangeMaskBits.ToString());
-                m_TargetGenerator.GenerateFragment("GHOST_FLUSH_FINAL_COMPONENT_CHANGE_MASK", replacements);
+                m_TargetGenerator.GenerateFragment("GHOST_CALCULATE_CHANGE_MASK_SETUP", replacements, m_TargetGenerator,
+                    "GHOST_CALCULATE_CHANGE_MASK", prepend:true);
+                m_TargetGenerator.GenerateFragment("GHOST_CALCULATE_CHANGE_MASK_SETUP", replacements, m_TargetGenerator,
+                    "GHOST_WRITE_COMBINED", prepend:true);
+                if(context.curChangeMaskBits > 0)
+                {
+                    replacements.Add("GHOST_CURRENT_MASK_BITS", context.curChangeMaskBits.ToString());
+                    replacements.Add("GHOST_CHANGE_MASK_BITS", (context.changeMaskBitCount - context.curChangeMaskBits).ToString());
+                    m_TargetGenerator.GenerateFragment("GHOST_FLUSH_FINAL_COMPONENT_CHANGE_MASK", replacements);
+                    m_TargetGenerator.AppendFragment("GHOST_FLUSH_FINAL_COMPONENT_CHANGE_MASK", m_TargetGenerator, "GHOST_WRITE_COMBINED");
+                }
             }
 
             if (!string.IsNullOrEmpty(type.Namespace))
@@ -352,15 +374,9 @@ namespace Unity.NetCode.Generators
             replacements.Add("GHOST_VARIANT_HASH", context.variantHash.ToString());
             replacements.Add("GHOST_SERIALIZES_ENABLED_BIT", type.ShouldSerializeEnabledBit ? "1" : "0");
 
-            if (type.GhostFields.Count == 0)
-            {
-                m_TargetGenerator.GenerateFragment("GHOST_HAS_NO_GHOST_FIELDS", replacements);
-            }
-
             if(type.GhostAttribute != null)
             {
-                replacements.Add("GHOST_PREFAB_TYPE", $"GhostPrefabType.{type.GhostAttribute.PrefabType.ToString()}");
-
+                replacements.Add("GHOST_PREFAB_TYPE", $"GhostPrefabType.{type.GhostAttribute.PrefabType.ToString("G").Replace(",", "| GhostPrefabType.")}");
                 if ((type.GhostAttribute.PrefabType&GhostPrefabType.Client) == GhostPrefabType.InterpolatedClient)
                     replacements.Add("GHOST_SEND_MASK", "GhostSendType.OnlyInterpolatedClients");
                 else if((type.GhostAttribute.PrefabType&GhostPrefabType.Client) == GhostPrefabType.PredictedClient)
@@ -399,19 +415,13 @@ namespace Unity.NetCode.Generators
                 replacements.Add("GHOST_SEND_CHILD_ENTITY", "0");
             }
 
-            if (type.ComponentType == ComponentType.Buffer || type.ComponentType == ComponentType.CommandData)
-                m_TargetGenerator.GenerateFragment("GHOST_COPY_FROM_BUFFER", replacements, m_TargetGenerator, "COPY_FROM_SNAPSHOT_SETUP");
-            else
-                m_TargetGenerator.GenerateFragment("GHOST_COPY_FROM_COMPONENT", replacements, m_TargetGenerator, "COPY_FROM_SNAPSHOT_SETUP");
-
-
             if (m_TargetGenerator.Fragments["__GHOST_REPORT_PREDICTION_ERROR__"].Content.Length > 0)
                 m_TargetGenerator.GenerateFragment("GHOST_PREDICTION_ERROR_HEADER", replacements, m_TargetGenerator);
 
-            var serializerName = context.generatorName + "Serializer.cs";
+            var serializerName = context.generatedFilePrefix + "Serializer.cs";
             m_TargetGenerator.GenerateFile(serializerName, type.Namespace, replacements, context.batch);
 
-            context.generatedTypes.Add(replacements["GHOST_NAME"]);
+            context.generatedTypes.Add($"global::{context.generatedNs}.{replacements["GHOST_NAME"]}");
         }
 
         public override string ToString()

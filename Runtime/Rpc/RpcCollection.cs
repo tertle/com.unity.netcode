@@ -2,6 +2,7 @@ using System;
 using Unity.Entities;
 using Unity.Collections;
 using Unity.Collections.LowLevel.Unsafe;
+using UnityEngine;
 
 namespace Unity.NetCode
 {
@@ -17,6 +18,7 @@ namespace Unity.NetCode
         {
             public ulong TypeHash;
             public PortableFunctionPointer<RpcExecutor.ExecuteDelegate> Execute;
+            public byte IsApprovalType;
 #if ENABLE_UNITY_COLLECTIONS_CHECKS || UNITY_DOTS_DEBUG
             public ComponentType RpcType;
 #endif
@@ -28,13 +30,34 @@ namespace Unity.NetCode
                     return 1;
                 return 0;
             }
+
+            public FixedString512Bytes ToFixedString()
+            {
+#if ENABLE_UNITY_COLLECTIONS_CHECKS || UNITY_DOTS_DEBUG
+                return (FixedString512Bytes)$"Rpc[{TypeHash}, {RpcType.ToFixedString()}]";
+                #else
+                return (FixedString512Bytes)$"Rpc[{TypeHash}, ???]";
+                #endif
+            }
         }
         /// <summary>
-        /// Treat the set of assemblies loaded on the client / server as dynamic or different. This is only required if
-        /// assemblies containing ghost component serializers or RPC serializers are removed when building standalone.
-        /// This property is read in OnUpdate, so it must be set before then. Defaults to false, which saves 6 bytes per header,
-        /// and allows RPC version errors to trigger immediately upon connecting to the server (rather than needing to wait for
-        /// an invalid RPC to be received).
+        /// <para>
+        /// Allows the set assemblies loaded on the client and server to differ. This is useful during development when
+        /// assemblies containing ghost component serializers or RPCs are removed when building standalone.
+        /// This usually happens during development when you are connecting a standalone player to the Editor.
+        /// For example, tests are usually not included in a standalone build, but they are still compiled and
+        /// registered in the Editor, which causes a mismatch in the set of assemblies.
+        /// </para>
+        /// <para>
+        /// If set to false (default), the RPC system triggers an RPC version error when connecting to a server with
+        /// a different set of assemblies. This is more strict and acts as a validation step during handshake.
+        /// </para>
+        /// <para>
+        /// If set to true, six bytes is added to the header of each RPC.
+        /// The RPC system doesn't trigger an RPC version error when connecting to
+        /// a server with a different set of assemblies. Instead, an error will be triggered if an invalid RPC or serialized component is
+        /// received.
+        /// </para>
         /// </summary>
         public bool DynamicAssemblyList
         {
@@ -50,6 +73,34 @@ namespace Unity.NetCode
         }
 
         /// <summary>
+        /// The RPC "common header" format is 9 bytes:
+        /// - Message Type: byte
+        /// - LocalTime: int (a.k.a. `remoteTime` on the receiver)
+        ///
+        /// And then, for each RPC, the header is:
+        /// - RpcHash: [short|long] (based on DynamicAssemblyList)
+        /// - Size: ushort
+        /// - Payload : x bytes
+        ///
+        /// So for a single message we have:
+        /// - 9 (common header) + 4 => 13 bytes (no DynamicAssemblyList)
+        /// - 9 (common header) + 10 => 19 bytes (with DynamicAssemblyList)
+        /// </summary>
+        /// <param name="dynamicAssemblyList">Whether or not your project is using <see cref="DynamicAssemblyList"/>.</param>
+        /// <returns>If <see cref="DynamicAssemblyList"/>, 15 bytes, otherwise 9 bytes.</returns>
+        public static int GetRpcHeaderLength(bool dynamicAssemblyList) => k_RpcCommonHeaderLengthBytes + GetInnerRpcMessageHeaderLength(dynamicAssemblyList);
+
+        /// <inheritdoc cref="GetRpcHeaderLength"/>>
+        internal const int k_RpcCommonHeaderLengthBytes = 5;
+
+        /// <summary>
+        /// If <see cref="DynamicAssemblyList"/>, 10 bytes, otherwise 4 bytes.
+        /// </summary>
+        /// <param name="dynamicAssemblyList">Whether or not your project is using <see cref="DynamicAssemblyList"/>.</param>
+        /// <returns>If <see cref="DynamicAssemblyList"/>, 10 bytes, otherwise 4 bytes.</returns>
+        internal static int GetInnerRpcMessageHeaderLength(bool dynamicAssemblyList) => dynamicAssemblyList ? 10 : 4;
+
+        /// <summary>
         /// Register a new RPC type which can be sent over the network. This must be called before
         /// any connections are established.
         /// </summary>
@@ -61,6 +112,18 @@ namespace Unity.NetCode
         {
             RegisterRpc(ComponentType.ReadWrite<TActionRequest>(), default(TActionSerializer).CompileExecute());
         }
+
+        /// <summary>
+        /// Register a new RPC type which can be sent over the network. This must be called before
+        /// any connections are established.
+        /// </summary>
+        /// <typeparam name="TActionRequestAndSerializer">A struct of type IComponentData, with IRpcCommandSerializer too.</typeparam>
+        public void RegisterRpc<TActionRequestAndSerializer>()
+            where TActionRequestAndSerializer : struct, IComponentData, IRpcCommandSerializer<TActionRequestAndSerializer>
+        {
+            RegisterRpc(ComponentType.ReadWrite<TActionRequestAndSerializer>(), default(TActionRequestAndSerializer).CompileExecute());
+        }
+
         /// <summary>
         /// Register a new RPC type which can be sent over the network. This must be called before
         /// any connections are established.
@@ -81,6 +144,11 @@ namespace Unity.NetCode
             var hash = TypeManager.GetTypeInfo(type.TypeIndex).StableTypeHash;
             if (hash == 0)
                 throw new InvalidOperationException(String.Format("Unexpected 0 hash for type {0}", type.GetManagedType()));
+
+            byte isApprovalType = 0;
+            if (IsApprovalRpcType(type))
+                isApprovalType = 1;
+
             if (m_RpcTypeHashToIndex.TryGetValue(hash, out var index))
             {
                 var rpcData = m_RpcData[index];
@@ -95,6 +163,7 @@ namespace Unity.NetCode
 #endif
                 }
 
+                rpcData.IsApprovalType = isApprovalType;
                 rpcData.TypeHash = hash;
                 rpcData.Execute = exec;
                 m_RpcData[index] = rpcData;
@@ -106,11 +175,30 @@ namespace Unity.NetCode
                 {
                     TypeHash = hash,
                     Execute = exec,
+                    IsApprovalType = isApprovalType,
 #if ENABLE_UNITY_COLLECTIONS_CHECKS
                     RpcType = type
 #endif
                 });
             }
+        }
+
+        internal static bool IsApprovalRpcType(ComponentType type)
+        {
+            // TODO - Infer via code-gen, rather than runtime reflection!
+            return typeof(IApprovalRpcCommand).IsAssignableFrom(type.GetManagedType());
+        }
+
+        /// <summary>
+        /// Get an RpcQueue which can be used to send RPCs.
+        /// </summary>
+        /// <typeparam name="TActionRequestAndSerializer">Struct of type <see cref="TActionRequestAndSerializer"/>
+        /// implementing <see cref="IRpcCommandSerializer{TActionRequestAndSerializer}"/>.</typeparam>
+        /// <returns><see cref="RpcQueue{TActionRequestAndSerializer,TActionRequestAndSerializer}"/> to be used to send RPCs.</returns>
+        public RpcQueue<TActionRequestAndSerializer, TActionRequestAndSerializer> GetRpcQueue<TActionRequestAndSerializer>()
+            where TActionRequestAndSerializer : struct, IComponentData, IRpcCommandSerializer<TActionRequestAndSerializer>
+        {
+            return GetRpcQueue<TActionRequestAndSerializer, TActionRequestAndSerializer>();
         }
 
         /// <summary>
@@ -153,6 +241,7 @@ namespace Unity.NetCode
         /// </summary>
         internal ulong CalculateVersionHash()
         {
+            Debug.Assert(m_IsFinal == 0);
             if (m_RpcData.Length >= ushort.MaxValue)
                 throw new InvalidOperationException(String.Format("RpcSystem does not support more than {0} RPCs", ushort.MaxValue));
             for (int i = 0; i < m_RpcData.Length; ++i)
@@ -183,42 +272,9 @@ namespace Unity.NetCode
             for (int i = 0; i < m_RpcData.Length; ++i)
                 hash = TypeHash.CombineFNV1A64(hash, m_RpcData[i].TypeHash);
             m_IsFinal = 1;
-            return (m_DynamicAssemblyList.Value == 1) ? 0 : hash;
+            return hash;
         }
-        internal static unsafe void SendProtocolVersion(DynamicBuffer<OutgoingRpcDataStreamBuffer> buffer, NetworkProtocolVersion version)
-        {
-            bool dynamicAssemblyList = (version.RpcCollectionVersion == 0);
-            int msgHeaderLen = dynamicAssemblyList ? 10 : 4;
-            DataStreamWriter writer = new DataStreamWriter(UnsafeUtility.SizeOf<NetworkProtocolVersion>() + msgHeaderLen + 1, Allocator.Temp);
-#if ENABLE_UNITY_COLLECTIONS_CHECKS
-            if (buffer.Length != 0)
-                throw new InvalidOperationException("Protocol version must be the very first RPC sent");
-#endif
-            if (dynamicAssemblyList)
-                writer.WriteULong(0);
-            else
-                writer.WriteUShort(ushort.MaxValue);
-            var lenWriter = writer;
-            writer.WriteUShort((ushort)0);
-            writer.WriteInt(version.NetCodeVersion);
-            writer.WriteInt(version.GameVersion);
-            if (dynamicAssemblyList)
-            {
-                writer.WriteULong(0);
-                writer.WriteULong(0);
-            }
-            else
-            {
-                writer.WriteULong(version.RpcCollectionVersion);
-                writer.WriteULong(version.ComponentCollectionVersion);
-            }
-            lenWriter.WriteUShort((ushort)(writer.Length - msgHeaderLen - 1));
-            var prevLen = buffer.Length;
-            buffer.ResizeUninitialized(buffer.Length + writer.Length);
-            byte* ptr = (byte*) buffer.GetUnsafePtr();
-            ptr += prevLen;
-            UnsafeUtility.MemCpy(ptr, writer.AsNativeArray().GetUnsafeReadOnlyPtr(), writer.Length);
-        }
+
         internal NativeList<RpcData> Rpcs => m_RpcData;
 
         internal NativeList<RpcData> m_RpcData;

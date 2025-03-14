@@ -3,15 +3,15 @@ using System;
 namespace Unity.NetCode
 {
     /// <summary>
-    /// <para>Generate a serialization variant for a component using the <seealso cref="GhostFieldAttribute"/> annotations
+    /// <para>Generate a serialization variant for a component using the <see cref="GhostFieldAttribute"/> annotations
     /// present in variant declaration.
     /// The component variant can be assigned at authoring time using the GhostAuthoringComponent editor.</para>
     /// <para>Note: This is incompatible with any type implementing <see cref="DontSupportPrefabOverridesAttribute"/>.</para>
+    /// </summary>
     /// <remarks>
     /// When declaring a variant, all fields that should be serialized must be declared. Any missing field or new field
     /// not present in the original struct will not be serialized.
     /// </remarks>
-    /// </summary>
     [AttributeUsage(AttributeTargets.Struct)]
     public class GhostComponentVariationAttribute : Attribute
     {

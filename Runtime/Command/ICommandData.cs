@@ -1,7 +1,12 @@
 using System;
+using System.Runtime.CompilerServices;
+using System.Text;
+using Unity.Burst.CompilerServices;
 using Unity.Collections;
+using Unity.Collections.LowLevel.Unsafe;
 using Unity.Entities;
 using Unity.NetCode.LowLevel.Unsafe;
+using UnityEngine;
 
 namespace Unity.NetCode
 {
@@ -61,6 +66,14 @@ namespace Unity.NetCode
         /// </summary>
         [DontSerializeForCommand]
         NetworkTick Tick { get; set; }
+
+        /// <summary>
+        /// Implement this to get Burst-compatible input struct packet dump logging.
+        /// Recommended format: $"field1:{field1}, field2:{field2}";
+        /// </summary>
+        /// <remarks>This function must be burst compatible too, otherwise you'll get burst compiler errors.</remarks>
+        /// <returns>Field values of your input struct.</returns>
+        public FixedString512Bytes ToFixedString() => "?ICD?";
     }
 
     /// <summary>
@@ -70,8 +83,8 @@ namespace Unity.NetCode
     /// If you enable manual serializaton, you must create a public struct that implement the ICommandDataSerializer for your type, as
     /// well as the necessary send and received systems in order to have your RPC sent and received.
     /// </summary>
-    /// <typeparam name="T"></typeparam>
-    public interface ICommandDataSerializer<T> where T: struct, ICommandData
+    /// <typeparam name="T">Your data type.</typeparam>
+    public interface ICommandDataSerializer<T> where T: unmanaged, ICommandData
     {
         /// <summary>
         /// Serialize the command to the data stream.
@@ -79,7 +92,7 @@ namespace Unity.NetCode
         /// <param name="writer">An instance of a <see cref="DataStreamWriter"/></param>
         /// <param name="state">An instance of <see cref="RpcSerializerState"/> used to carry some additional data and accessor
         /// for serializing the command field type. In particular, used to serialize entity</param>
-        /// <param name="data"></param>
+        /// <param name="data">Command</param>
         void Serialize(ref DataStreamWriter writer, in RpcSerializerState state, in T data);
         /// <summary>
         /// Deserialize a single command from the data stream.
@@ -87,7 +100,7 @@ namespace Unity.NetCode
         /// <param name="reader">An instance of a <see cref="DataStreamWriter"/></param>
         /// <param name="state">An instance of <see cref="RpcSerializerState"/> used to carry some additional data and accessor
         /// for serializing the command field type. In particular, used to serialize entity</param>
-        /// <param name="data"></param>
+        /// <param name="data">Command</param>
         void Deserialize(ref DataStreamReader reader, in RpcDeserializerState state, ref T data);
 
         /// <summary>
@@ -96,9 +109,9 @@ namespace Unity.NetCode
         /// <param name="writer">An instance of a <see cref="DataStreamWriter"/></param>
         /// <param name="state">An instance of <see cref="RpcSerializerState"/> used to carry some additional data and accessor
         /// for serializing the command field type. In particular, used to serialize entity</param>
-        /// <param name="data"></param>
-        /// <param name="baseline"></param>
-        /// <param name="compressionModel"></param>
+        /// <param name="data">Command</param>
+        /// <param name="baseline">Baseline command</param>
+        /// <param name="compressionModel">Delta compression model</param>
         void Serialize(ref DataStreamWriter writer, in RpcSerializerState state, in T data, in T baseline, StreamCompressionModel compressionModel);
 
         /// <summary>
@@ -107,10 +120,34 @@ namespace Unity.NetCode
         /// <param name="reader">An instance of a <see cref="DataStreamWriter"/></param>
         /// <param name="state">An instance of <see cref="RpcSerializerState"/> used to carry some additional data and accessor
         /// for serializing the command field type. In particular, used to serialize entity</param>
-        /// <param name="data"></param>
-        /// <param name="baseline"></param>
-        /// <param name="compressionModel"></param>
+        /// <param name="data">Command</param>
+        /// <param name="baseline">Baseline command</param>
+        /// <param name="compressionModel">Delta compression model</param>
         void Deserialize(ref DataStreamReader reader, in RpcDeserializerState state, ref T data, in T baseline, StreamCompressionModel compressionModel);
+
+        /// <summary>
+        /// Used to delta-compress this command when sending it via the
+        /// <see cref="CommandSendSystem{TCommandDataSerializer,TCommandData}"/>.
+        /// </summary>
+        /// <remarks>
+        /// The default interface implementation (maintained for non-breaking change backwards compatibility) always returns 1 (has changes),
+        /// so we strongly recommend overriding it in your own implementation (assuming your implementing this interface yourself).
+        /// The automatic code-generated version uses a per-field change mask automatically.
+        /// </remarks>
+        /// <param name="snapshot">The current value.</param>
+        /// <param name="baseline">The previous/baseline value.</param>
+        /// <returns>A change-mask, 0 if unchanged.</returns>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        uint CalculateChangeMask(in T snapshot, in T baseline) => 1u;
+
+        /// <summary>Helper.</summary>
+        /// <returns>A short name, for use in packet dumps.</returns>
+        public FixedString64Bytes ToFixedString()
+        {
+            var fs = new FixedString64Bytes();
+            fs.CopyFromTruncated(ComponentType.ReadWrite<T>().ToFixedString()); // Ensure now overflow...
+            return fs;
+        }
     }
 
     /// <summary>
@@ -129,10 +166,10 @@ namespace Unity.NetCode
         /// it will return tick 5 (latest without going over). If the command buffer is
         /// 1,2,3 and targetTick is 5 it will return tick 3.
         /// </summary>
-        /// <param name="commandArray"></param>
-        /// <param name="targetTick"></param>
-        /// <param name="commandData"></param>
-        /// <typeparam name="T"></typeparam>
+        /// <param name="commandArray">Command input buffer.</param>
+        /// <param name="targetTick">Target tick to fetch from.</param>
+        /// <param name="commandData">The last-received input.</param>
+        /// <typeparam name="T">Command input buffer type.</typeparam>
         /// <returns>Returns true if any data was found, false when no tick data is equal or older to the target tick in the buffer.</returns>
         public static bool GetDataAtTick<T>(this DynamicBuffer<T> commandArray, NetworkTick targetTick, out T commandData)
             where T : unmanaged, ICommandData
@@ -170,9 +207,9 @@ namespace Unity.NetCode
         /// the buffer is not going to be modified. That would invalidate the reference in that case and we can't guaratee
         /// the data you are reading is going to be valid anymore.
         /// </summary>
-        /// <param name="buffer"></param>
-        /// <param name="index"></param>
-        /// <typeparam name="T"></typeparam>
+        /// <param name="buffer">Buffer to index</param>
+        /// <param name="index">index to get input</param>
+        /// <typeparam name="T">the command type</typeparam>
         /// <returns>A readonly reference to the element</returns>
         public static ref readonly T GetInputAtIndex<T>(this DynamicBuffer<T> buffer, int index) where T: unmanaged, ICommandData
         {
@@ -186,22 +223,25 @@ namespace Unity.NetCode
         /// If a command with the same tick already exists in the buffer, it will be overritten
         /// </summary>
         /// <typeparam name="T">the command type</typeparam>
-        /// <param name="commandArray"></param>
-        /// <param name="commandData"></param>
-        public static void AddCommandData<T>(this DynamicBuffer<T> commandArray, T commandData)
+        /// <param name="commandBuffer">The buffer being written to.</param>
+        /// <param name="commandData">The individual input struct to add.</param>
+        /// <returns>True if we replaced an existing input at this exact tick value.</returns>
+        public static bool AddCommandData<T>(this DynamicBuffer<T> commandBuffer, T commandData)
             where T : unmanaged, ICommandData
         {
+            if (Hint.Unlikely(!commandData.Tick.IsValid))
+                return false;
+
             var targetTick = commandData.Tick;
             int oldestIdx = 0;
             NetworkTick oldestTick = NetworkTick.Invalid;
-            for (int i = 0; i < commandArray.Length; ++i)
+            for (int i = 0; i < commandBuffer.Length; ++i)
             {
-                var tick = commandArray[i].Tick;
+                var tick = commandBuffer[i].Tick;
                 if (tick == targetTick)
                 {
-                    // Already exists, replace it
-                    commandArray[i] = commandData;
-                    return;
+                    commandBuffer[i] = commandData;
+                    return true;
                 }
 
                 if (!oldestTick.IsValid || oldestTick.IsNewerThan(tick))
@@ -211,10 +251,17 @@ namespace Unity.NetCode
                 }
             }
 
-            if (commandArray.Length < k_CommandDataMaxSize)
-                commandArray.Add(commandData);
+            if (commandBuffer.Length < k_CommandDataMaxSize)
+                commandBuffer.Add(commandData);
             else
-                commandArray[oldestIdx] = commandData;
+                commandBuffer[oldestIdx] = commandData;
+            return false;
+        }
+
+        internal static FixedString64Bytes FormatBitsBytes(int sizeBits)
+        {
+            var bytes = (sizeBits + 7) / 8;
+            return bytes <= 1 ? $"{sizeBits} bits" : $"{sizeBits} bits [{bytes} bytes]";
         }
     }
 }

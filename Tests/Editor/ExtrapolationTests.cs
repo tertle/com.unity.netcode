@@ -1,13 +1,6 @@
 using NUnit.Framework;
 using Unity.Entities;
-using Unity.Networking.Transport;
-using Unity.NetCode.Tests;
-using Unity.Jobs;
 using UnityEngine;
-using Unity.NetCode;
-using Unity.Mathematics;
-using Unity.Transforms;
-using Unity.Collections;
 
 namespace Unity.NetCode.Tests
 {
@@ -98,16 +91,16 @@ namespace Unity.NetCode.Tests
 
                 testWorld.SpawnOnServer(ghostGameObject);
 
-                float frameTime = 1.0f / 60.0f;
                 // Connect and make sure the connection could be established
-                testWorld.Connect(frameTime);
+                testWorld.Connect();
 
                 // Go in-game
                 testWorld.GoInGame();
 
-
-                for (int i = 0; i < 8; ++i)
-                    testWorld.Tick(frameTime);
+                // Takes longer to replicate a ghost because we only replicate snapshots every other frame
+                // (due to NetworkTickRate = 30 + GhostSendSystem.m_ConnectionsToProcess == 0).
+                for (int i = 0; i < 9; ++i)
+                    testWorld.Tick();
 
                 var clientEnt = testWorld.TryGetSingletonEntity<TestExtrapolated>(testWorld.ClientWorlds[0]);
                 Assert.AreNotEqual(Entity.Null, clientEnt);
@@ -115,7 +108,7 @@ namespace Unity.NetCode.Tests
                 Assert.Less(testWorld.ClientWorlds[0].EntityManager.GetComponentData<TestExtrapolated>(clientEnt).Value, 100);
                 // Let the game run for a bit so the ghosts are spawned on the client
                 for (int i = 0; i < 256; ++i)
-                    testWorld.Tick(frameTime);
+                    testWorld.Tick();
 
                 Assert.Greater(testWorld.ClientWorlds[0].EntityManager.GetComponentData<TestExtrapolated>(clientEnt).Value, 200);
             }
@@ -147,16 +140,15 @@ namespace Unity.NetCode.Tests
 
                 testWorld.SpawnOnServer(ghostGameObject);
 
-                float frameTime = 1.0f / 60.0f;
                 // Connect and make sure the connection could be established
-                testWorld.Connect(frameTime);
+                testWorld.Connect();
 
                 // Go in-game
                 testWorld.GoInGame();
 
                 // Let the simulation run for a bit since extrapolation requires two snapshots to be received before it does anything
                 for (int i = 0; i < 256; ++i)
-                    testWorld.Tick(frameTime);
+                    testWorld.Tick();
 
                 // Enable the checks
                 var clientEnt = testWorld.TryGetSingletonEntity<TestExtrapolated>(testWorld.ClientWorlds[0]);
@@ -165,7 +157,7 @@ namespace Unity.NetCode.Tests
 
                 // Let the game run for a bit more and verify that they are extrapolated
                 for (int i = 0; i < 256; ++i)
-                    testWorld.Tick(frameTime);
+                    testWorld.Tick();
             }
         }
     }

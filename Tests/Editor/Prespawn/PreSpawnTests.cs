@@ -5,7 +5,6 @@ using System.Text.RegularExpressions;
 using NUnit.Framework;
 using Unity.Collections;
 using Unity.Entities;
-using Unity.Jobs;
 using Unity.NetCode.Tests;
 using Unity.Transforms;
 using UnityEditor;
@@ -13,6 +12,7 @@ using UnityEditor.SceneManagement;
 using UnityEngine;
 using UnityEngine.SceneManagement;
 using Unity.Mathematics;
+using Unity.Networking.Transport;
 
 namespace Unity.NetCode.PrespawnTests
 {
@@ -70,8 +70,6 @@ namespace Unity.NetCode.PrespawnTests
 
     public class PreSpawnTests : TestWithSceneAsset
     {
-        private const float frameTime = 1.0f / 60f;
-
         void CheckAllPrefabsInWorlds(NetCodeTestWorld testWorld)
         {
             CheckAllPrefabsInWorld(testWorld.ServerWorld);
@@ -167,11 +165,11 @@ namespace Unity.NetCode.PrespawnTests
                 testWorld.Bootstrap(true);
                 testWorld.CreateWorlds(true, 1);
                 SubSceneHelper.LoadSubSceneInWorlds(testWorld);
-                testWorld.Connect(frameTime);
+                testWorld.Connect();
                 testWorld.GoInGame();
                 // Give Prespawn ghosts processing a chance to run a bunch of times
                 for (int i = 0; i < 16; ++i)
-                    testWorld.Tick(frameTime);
+                    testWorld.Tick();
                 var query = testWorld.ServerWorld.EntityManager.CreateEntityQuery(typeof(PrespawnsSceneInitialized));
                 Assert.AreEqual(0, query.CalculateEntityCount());
             }
@@ -192,11 +190,11 @@ namespace Unity.NetCode.PrespawnTests
                 SubSceneHelper.LoadSubSceneInWorlds(testWorld);
                 testWorld.ServerWorld.EntityManager.CreateEntity(typeof(EnableVerifyGhostIds));
                 testWorld.ClientWorlds[0].EntityManager.CreateEntity(typeof(EnableVerifyGhostIds));
-                testWorld.Connect(frameTime);
+                testWorld.Connect();
                 testWorld.GoInGame();
                 for(int i=0;i<64;++i)
                 {
-                    testWorld.Tick(frameTime);
+                    testWorld.Tick();
                     if (testWorld.ServerWorld.GetExistingSystemManaged<VerifyGhostIds>().Matches == VerifyGhostIds.GhostsPerScene &&
                         testWorld.ClientWorlds[0].GetExistingSystemManaged<VerifyGhostIds>().Matches == VerifyGhostIds.GhostsPerScene)
                         break;
@@ -224,7 +222,7 @@ namespace Unity.NetCode.PrespawnTests
                 testWorld.Bootstrap(true);
                 testWorld.CreateWorlds(true, 2);
                 SubSceneHelper.LoadSubSceneInWorlds(testWorld);
-                testWorld.Connect(frameTime);
+                testWorld.Connect();
                 //Set in game the first client
                 testWorld.SetInGame(0);
                 // Delete one prespawned entity on the server
@@ -233,7 +231,7 @@ namespace Unity.NetCode.PrespawnTests
                 var prespawnedQuery = testWorld.ServerWorld.EntityManager.CreateEntityQuery(typeof(GhostInstance), ComponentType.ReadOnly<PreSpawnedGhostIndex>());
                 for (int i = 0; i < 16; ++i)
                 {
-                    testWorld.Tick(1.0f/60.0f);
+                    testWorld.Tick();
                     var prespawnedGhost = q.ToComponentDataArray<GhostInstance>(Allocator.Temp);
                     // Filter for GhostComoponent and grab it after prespawn processing is done (ghost id valid)
                     if (prespawnedGhost.Length == 0 || (prespawnedGhost.Length > 0 && prespawnedGhost[0].ghostId == 0))
@@ -263,7 +261,7 @@ namespace Unity.NetCode.PrespawnTests
                 prespawnedCount = query.CalculateEntityCount();
                 for (int i = 0; i < 128; ++i)
                 {
-                    testWorld.Tick(1.0f/60.0f);
+                    testWorld.Tick();
                     exists = false;
                     var prespawnedData = query.ToComponentDataArray<PreSpawnedGhostIndex>(Allocator.Temp);
                     prespawnedCount = prespawnedData.Length;
@@ -306,7 +304,7 @@ namespace Unity.NetCode.PrespawnTests
                 SubSceneHelper.LoadSubSceneInWorlds(testWorld);
                 testWorld.ServerWorld.EntityManager.CreateEntity(typeof(EnableVerifyGhostIds));
                 testWorld.ClientWorlds[0].EntityManager.CreateEntity(typeof(EnableVerifyGhostIds));
-                testWorld.Connect(frameTime);
+                testWorld.Connect();
                 testWorld.GoInGame();
                 // If servers spawns something before connection is in game it will be registered as a prespawned entity
                 // Wait until prespawned ghosts have been initialized
@@ -314,7 +312,7 @@ namespace Unity.NetCode.PrespawnTests
                     typeof(GhostInstance));
                 for (int i = 0; i < 16; ++i)
                 {
-                    testWorld.Tick(frameTime);
+                    testWorld.Tick();
                     var prespawns = query.CalculateEntityCount();
                     if (prespawns > 0)
                         break;
@@ -328,7 +326,7 @@ namespace Unity.NetCode.PrespawnTests
                 var clientQuery = testWorld.ClientWorlds[0].EntityManager.CreateEntityQuery(typeof(GhostInstance), typeof(PreSpawnedGhostIndex));
                 for (int i = 0; i < 64 && currentCount != ghostCount; ++i)
                 {
-                    testWorld.Tick(frameTime);
+                    testWorld.Tick();
                     currentCount = clientQuery.CalculateEntityCount();
                 }
                 Assert.That(ghostCount == currentCount, "Client did not spawn runtime entity (clientCount=" + currentCount + " serverCount=" + ghostCount + ")");
@@ -353,7 +351,7 @@ namespace Unity.NetCode.PrespawnTests
                 var clientGhosts = testWorld.ClientWorlds[0].EntityManager.CreateEntityQuery(typeof(GhostInstance));
                 for (int i = 0; i < 16; ++i)
                 {
-                    testWorld.Tick(frameTime);
+                    testWorld.Tick();
                     // clientGhostCount will be 6 for a bit as it creates an initial archetype ghost and later a delayed one when on the right tick
                     serverGhostCount = serverGhosts.CalculateEntityCount();
                     clientGhostCount = clientGhosts.CalculateEntityCount();
@@ -386,10 +384,10 @@ namespace Unity.NetCode.PrespawnTests
                 SubSceneHelper.LoadSubSceneInWorlds(testWorld);
                 testWorld.ServerWorld.EntityManager.CreateEntity(typeof(EnableVerifyGhostIds));
                 testWorld.ClientWorlds[0].EntityManager.CreateEntity(typeof(EnableVerifyGhostIds));
-                testWorld.Connect(frameTime);
+                testWorld.Connect();
                 testWorld.GoInGame();
                 for(int i=0;i<64;++i)
-                    testWorld.Tick(1.0f/60.0f);
+                    testWorld.Tick();
 
                 int prespawnedGhostCount = VerifyGhostIds.GhostsPerScene*GhostScenes;
                 var prespawned = testWorld.ServerWorld.EntityManager.CreateEntityQuery(typeof(PreSpawnedGhostIndex)).CalculateEntityCount();
@@ -402,7 +400,6 @@ namespace Unity.NetCode.PrespawnTests
         }
 
         [Test]
-        [Ignore("DOTS-6619 Test instability, causes crash when loading subscenes")]
         public void ManyPrespawnedObjects()
         {
             const int SubSceneCount = 10;
@@ -424,11 +421,11 @@ namespace Unity.NetCode.PrespawnTests
                 SubSceneHelper.LoadSubSceneInWorlds(testWorld);
                 testWorld.ServerWorld.EntityManager.CreateEntity(typeof(EnableVerifyGhostIds));
                 testWorld.ClientWorlds[0].EntityManager.CreateEntity(typeof(EnableVerifyGhostIds));
-                testWorld.Connect(frameTime);
+                testWorld.Connect();
                 testWorld.GoInGame();
                 for (int i=0; i<64;++i)
                 {
-                    testWorld.Tick(frameTime);
+                    testWorld.Tick();
                     if (testWorld.ServerWorld.GetExistingSystemManaged<VerifyGhostIds>().Matches == VerifyGhostIds.GhostsPerScene &&
                         testWorld.ClientWorlds[0].GetExistingSystemManaged<VerifyGhostIds>().Matches == VerifyGhostIds.GhostsPerScene)
                         break;
@@ -488,11 +485,11 @@ namespace Unity.NetCode.PrespawnTests
                 SubSceneHelper.LoadSubSceneInWorlds(testWorld);
                 testWorld.ServerWorld.EntityManager.CreateEntity(typeof(EnableVerifyGhostIds));
                 testWorld.ClientWorlds[0].EntityManager.CreateEntity(typeof(EnableVerifyGhostIds));
-                testWorld.Connect(frameTime);
+                testWorld.Connect();
                 testWorld.GoInGame();
                 for(int i=0;i<64;++i)
                 {
-                    testWorld.Tick(frameTime);
+                    testWorld.Tick();
                     if (testWorld.ServerWorld.GetExistingSystemManaged<VerifyGhostIds>().Matches == VerifyGhostIds.GhostsPerScene &&
                         testWorld.ClientWorlds[0].GetExistingSystemManaged<VerifyGhostIds>().Matches == VerifyGhostIds.GhostsPerScene)
                         break;
@@ -522,11 +519,11 @@ namespace Unity.NetCode.PrespawnTests
                 SubSceneHelper.LoadSubSceneInWorlds(testWorld);
                 testWorld.ServerWorld.EntityManager.CreateEntity(typeof(EnableVerifyGhostIds));
                 testWorld.ClientWorlds[0].EntityManager.CreateEntity(typeof(EnableVerifyGhostIds));
-                testWorld.Connect(frameTime);
+                testWorld.Connect();
                 testWorld.GoInGame();
                 for(int i=0;i<64;++i)
                 {
-                    testWorld.Tick(frameTime);
+                    testWorld.Tick();
                     if (testWorld.ServerWorld.GetExistingSystemManaged<VerifyGhostIds>().Matches == VerifyGhostIds.GhostsPerScene &&
                         testWorld.ClientWorlds[0].GetExistingSystemManaged<VerifyGhostIds>().Matches == VerifyGhostIds.GhostsPerScene)
                         break;
@@ -557,11 +554,11 @@ namespace Unity.NetCode.PrespawnTests
                 SubSceneHelper.LoadSubSceneInWorlds(testWorld);
                 testWorld.ServerWorld.EntityManager.CreateEntity(typeof(EnableVerifyGhostIds));
                 testWorld.ClientWorlds[0].EntityManager.CreateEntity(typeof(EnableVerifyGhostIds));
-                testWorld.Connect(frameTime);
+                testWorld.Connect();
                 testWorld.GoInGame();
                 for(int i=0;i<64;++i)
                 {
-                    testWorld.Tick(frameTime);
+                    testWorld.Tick();
                     if (testWorld.ServerWorld.GetExistingSystemManaged<VerifyGhostIds>().Matches == VerifyGhostIds.GhostsPerScene &&
                         testWorld.ClientWorlds[0].GetExistingSystemManaged<VerifyGhostIds>().Matches == VerifyGhostIds.GhostsPerScene)
                         break;
@@ -587,7 +584,7 @@ namespace Unity.NetCode.PrespawnTests
             using (var testWorld = new NetCodeTestWorld())
             {
                 testWorld.Bootstrap(true);
-                testWorld.CreateWorlds(true, 1, true);
+                testWorld.CreateWorlds(true, 1);
                 SubSceneHelper.LoadSubSceneInWorlds(testWorld, subScene);
 
                 //Tamper some prespawn on the server or the client such that their data aren't the same.
@@ -602,15 +599,13 @@ namespace Unity.NetCode.PrespawnTests
                 }
                 entities.Dispose();
 
-                testWorld.Connect(frameTime);
+                testWorld.Connect();
                 testWorld.GoInGame();
 
-                UnityEngine.TestTools.LogAssert.Expect(LogType.Error, new Regex(@"Subscene (\w+) baseline mismatch."));
+                // Only expect to get the error once, as we disconnect immediately after getting it.
                 UnityEngine.TestTools.LogAssert.Expect(LogType.Error, new Regex(@"Subscene (\w+) baseline mismatch."));
                 for(int i=0;i<10;++i)
-                    testWorld.Tick(1.0f/60.0f);
-
-                //FIXME: at a certain point I should disconnect if I don't load the second subscene
+                    testWorld.Tick();
 
                 // Verify connection is now disconnected
                 var conQuery = testWorld.ClientWorlds[0].EntityManager.CreateEntityQuery(ComponentType.ReadOnly<NetworkId>());
@@ -634,13 +629,13 @@ namespace Unity.NetCode.PrespawnTests
                 testWorld.SetServerTick(new NetworkTick((UInt32.MaxValue>>1) - 16));
                 testWorld.ServerWorld.EntityManager.CreateEntity(typeof(EnableVerifyGhostIds));
                 testWorld.ClientWorlds[0].EntityManager.CreateEntity(typeof(EnableVerifyGhostIds));
-                testWorld.Connect(frameTime);
+                testWorld.Connect();
                 testWorld.GoInGame();
                 for(int i=0;i<32;++i)
                 {
                     if (testWorld.GetNetworkTime(testWorld.ServerWorld).ServerTick.TickIndexForValidTick >= (UInt32.MaxValue>>1) - 3)
                         testWorld.SpawnOnServer(0);
-                    testWorld.Tick(frameTime);
+                    testWorld.Tick();
                     if (testWorld.ServerWorld.GetExistingSystemManaged<VerifyGhostIds>().Matches == VerifyGhostIds.GhostsPerScene &&
                         testWorld.ClientWorlds[0].GetExistingSystemManaged<VerifyGhostIds>().Matches == VerifyGhostIds.GhostsPerScene)
                         break;
@@ -651,6 +646,7 @@ namespace Unity.NetCode.PrespawnTests
                 Assert.AreEqual(VerifyGhostIds.GhostsPerScene, prespawned, "Didn't find expected amount of prespawned entities in the client subscene");
                 Assert.AreEqual(VerifyGhostIds.GhostsPerScene, testWorld.ServerWorld.GetExistingSystemManaged<VerifyGhostIds>().Matches, "Prespawn components added but didn't get ghost ID applied at runtime on server");
                 Assert.AreEqual(VerifyGhostIds.GhostsPerScene, testWorld.ClientWorlds[0].GetExistingSystemManaged<VerifyGhostIds>().Matches, "Prespawn components added but didn't get ghost ID applied at runtime on client");
+                Assert.AreEqual(testWorld.GetNetworkTime(testWorld.ServerWorld).ServerTick.TickValue, testWorld.GetNetworkTime(testWorld.ServerWorld).InterpolationTick.TickValue, "ServerTick is not equal to InterpolationTick on server world");
             }
         }
 
@@ -668,14 +664,14 @@ namespace Unity.NetCode.PrespawnTests
             using (var testWorld = new NetCodeTestWorld())
             {
                 testWorld.Bootstrap(true);
-                testWorld.CreateWorlds(true, 1, true);
+                testWorld.CreateWorlds(true, 1);
                 SubSceneHelper.LoadSubSceneInWorlds(testWorld, subScene);
 
-                testWorld.Connect(frameTime);
+                testWorld.Connect();
                 testWorld.GoInGame();
 
                 for(int i=0;i<16;++i)
-                    testWorld.Tick(1.0f/60.0f);
+                    testWorld.Tick();
 
                 ref var ghostRelevancy = ref testWorld.GetSingletonRW<GhostRelevancy>(testWorld.ServerWorld).ValueRW;
                 ghostRelevancy.GhostRelevancyMode = GhostRelevancyMode.SetIsIrrelevant;
@@ -690,7 +686,7 @@ namespace Unity.NetCode.PrespawnTests
                 }
 
                 for(int i=0;i<16;++i)
-                    testWorld.Tick(1.0f/60.0f);
+                    testWorld.Tick();
 
                 // Verify all ghosts have despawned
                 query = testWorld.ClientWorlds[0].EntityManager.CreateEntityQuery(
@@ -700,7 +696,7 @@ namespace Unity.NetCode.PrespawnTests
                 relevancySet.Clear();
 
                 for(int i=0;i<16;++i)
-                    testWorld.Tick(1.0f/60.0f);
+                    testWorld.Tick();
 
                 // Verify all ghosts have been spawned again
                 query = testWorld.ClientWorlds[0].EntityManager.CreateEntityQuery(
@@ -724,10 +720,10 @@ namespace Unity.NetCode.PrespawnTests
             using (var testWorld = new NetCodeTestWorld())
             {
                 testWorld.Bootstrap(true);
-                testWorld.CreateWorlds(true, 2, true);
+                testWorld.CreateWorlds(true, 2);
                 SubSceneHelper.LoadSubSceneInWorlds(testWorld, subScene);
 
-                testWorld.Connect(frameTime);
+                testWorld.Connect();
                 testWorld.GoInGame();
 
                 // Prespawns on the client and server have the same values, even before replication.
@@ -736,7 +732,7 @@ namespace Unity.NetCode.PrespawnTests
 
                 // Ensure the values don't get corrupted by early replication.
                 for(int i=0;i<8;++i)
-                    testWorld.Tick(1.0f/60.0f);
+                    testWorld.Tick();
 
                 foreach (var clientWorld in testWorld.ClientWorlds)
                     ValidateClientVsServer(testWorld.ServerWorld, clientWorld);
@@ -780,7 +776,7 @@ namespace Unity.NetCode.PrespawnTests
 
                 // Replicate new values, then test again to ensure they replicate properly:
                 for(int i=0;i<8;++i)
-                    testWorld.Tick(1.0f/60.0f);
+                    testWorld.Tick();
 
                 foreach (var clientWorld in testWorld.ClientWorlds)
                     ValidateClientVsServer(testWorld.ServerWorld, clientWorld);
@@ -818,6 +814,156 @@ namespace Unity.NetCode.PrespawnTests
                     }
                 }
             }
+        }
+
+        [Test]
+        public void DisconnectReconnectWithPrespawns()
+        {
+            // Load prespawn scene client and server side
+            var ghost = SubSceneHelper.CreateSimplePrefab(ScenePath, "ghost", typeof(GhostAuthoringComponent), typeof(NetCodePrespawnAuthoring));
+            var scene = SubSceneHelper.CreateEmptyScene(ScenePath, "Parent");
+            SubSceneHelper.CreateSubSceneWithPrefabs(scene, ScenePath, "subscene", new[] { ghost }, 5);
+            SceneManager.SetActiveScene(scene);
+            using var testWorld = new NetCodeTestWorld();
+            testWorld.Bootstrap(true);
+            testWorld.CreateWorlds(true, 1);
+            SubSceneHelper.LoadSubSceneInWorlds(testWorld);
+
+            testWorld.Connect();
+            testWorld.GoInGame();
+
+            for (int i = 0; i < 8; i++)
+                testWorld.Tick();
+
+            // PrespawnAckSection must be added to client connection on the server, which means it's received the client request to start streaming the prespawn ghosts
+            var serverPrespawnAckQuery = testWorld.ServerWorld.EntityManager.CreateEntityQuery(ComponentType.ReadOnly<PrespawnSectionAck>());
+            Assert.AreEqual(1, serverPrespawnAckQuery.GetSingletonBuffer<PrespawnSectionAck>().Length);
+
+            for (int i = 0; i < 4; i++)
+                testWorld.Tick();
+
+            // Disconnect the client
+            using var driverQuery = testWorld.ClientWorlds[0].EntityManager.CreateEntityQuery(ComponentType.ReadOnly<NetworkStreamDriver>());
+            using var clientConnectionToServer = testWorld.ClientWorlds[0].EntityManager.CreateEntityQuery(ComponentType.ReadOnly<NetworkStreamConnection>());
+            var clientNetworkDriver = driverQuery.GetSingleton<NetworkStreamDriver>();
+            testWorld.ClientWorlds[0].EntityManager.CompleteAllTrackedJobs();
+            clientNetworkDriver.DriverStore.Disconnect(clientConnectionToServer.GetSingleton<NetworkStreamConnection>());
+
+            for (int i = 0; i < 4; i++)
+                testWorld.Tick();
+
+            // The streaming request flag has been disabled on the client
+            using var clientGhostCleanupComponentQuery = testWorld.ClientWorlds[0].EntityManager.CreateEntityQuery(ComponentType.ReadOnly<SubSceneWithGhostCleanup>());
+            var cleanupData = clientGhostCleanupComponentQuery.GetSingleton<SubSceneWithGhostCleanup>();
+            Assert.AreEqual(0, cleanupData.Streaming);
+
+            // Change the prespawn data while client is disconnected
+            var serverGhostQuery = testWorld.ServerWorld.EntityManager.CreateEntityQuery(ComponentType.ReadOnly<TestComponent2>());
+            var serverGhostEntities = serverGhostQuery.ToEntityArray(Allocator.Temp);
+            foreach (var testGhost in serverGhostEntities)
+            {
+                testWorld.ServerWorld.EntityManager.SetComponentData(testGhost, new TestComponent2(){ Test2 = 10000 });
+                testWorld.ServerWorld.EntityManager.SetComponentEnabled<TestBuffer3>(testGhost, true);
+                var buf = testWorld.ServerWorld.EntityManager.GetBuffer<TestBuffer3>(testGhost);
+                buf.Add(new TestBuffer3() { Test2 = 10 });
+                buf.Add(new TestBuffer3() { Test2 = 20 });
+            }
+
+            // Reconnect the client
+            clientNetworkDriver.Connect(testWorld.ClientWorlds[0].EntityManager, NetworkEndpoint.LoopbackIpv4.WithPort(7979));
+            for (int i = 0; i < 5; i++)
+                testWorld.Tick();
+            testWorld.GoInGame();
+
+            // Stream request flag has been enabled again
+            cleanupData = clientGhostCleanupComponentQuery.GetSingleton<SubSceneWithGhostCleanup>();
+            Assert.AreEqual(1, cleanupData.Streaming);
+
+            for (int i = 0; i < 6; i++)
+                testWorld.Tick();
+
+            // Verify client has latest prespawn ghost data
+            using var clientGhostTest2Query = testWorld.ClientWorlds[0].EntityManager.CreateEntityQuery(ComponentType.ReadOnly<TestComponent2>());
+            using var clientGhostEntitiesQuery = testWorld.ClientWorlds[0].EntityManager.CreateEntityQuery(ComponentType.ReadOnly<TestComponent2>(), ComponentType.ReadOnly<TestBuffer3>());
+            var clientGhostTest2Data = clientGhostTest2Query.ToComponentDataArray<TestComponent2>(Allocator.Temp);
+            var clientGhostEntities = clientGhostEntitiesQuery.ToEntityArray(Allocator.Temp);
+
+            for (int i = 0; i < clientGhostTest2Data.Length; ++i)
+            {
+                Assert.AreEqual(10000, clientGhostTest2Data[i].Test2);
+                var buf = testWorld.ClientWorlds[0].EntityManager.GetBuffer<TestBuffer3>(clientGhostEntities[i]);
+                Assert.AreEqual(7, buf.Length);
+                Assert.AreEqual(10, buf[^2].Test2);
+                Assert.AreEqual(20, buf[^1].Test2);
+            }
+
+            // Move prespawns again and verify the changes are transferred to the client
+            foreach (var testGhost in serverGhostEntities)
+            {
+                testWorld.ServerWorld.EntityManager.SetComponentData(testGhost, new TestComponent2(){ Test2 = 20000 });
+                var buf = testWorld.ServerWorld.EntityManager.GetBuffer<TestBuffer3>(testGhost);
+                buf.Add(new TestBuffer3() { Test2 = 30 });
+                buf.Add(new TestBuffer3() { Test2 = 40 });
+            }
+            for (int i = 0; i < 6; i++)
+                testWorld.Tick();
+            clientGhostTest2Data = clientGhostTest2Query.ToComponentDataArray<TestComponent2>(Allocator.Temp);
+            for (int i = 0; i < clientGhostTest2Data.Length; ++i)
+            {
+                Assert.AreEqual(20000, clientGhostTest2Data[i].Test2);
+                var buf = testWorld.ClientWorlds[0].EntityManager.GetBuffer<TestBuffer3>(clientGhostEntities[i]);
+                Assert.AreEqual(9, buf.Length);
+                Assert.AreEqual(30, buf[^2].Test2);
+                Assert.AreEqual(40, buf[^1].Test2);
+            }
+        }
+
+        [Test]
+        public void TestPrespawnRelevancy()
+        {
+            // Prespawn info is stored in a ghost. We want to make sure internal unity ghosts are always relevant
+
+            // load prespawn scene client and server side
+            var ghost = SubSceneHelper.CreateSimplePrefab(ScenePath, "ghost", typeof(GhostAuthoringComponent));
+            var scene = SubSceneHelper.CreateEmptyScene(ScenePath, "Parent");
+            SubSceneHelper.CreateSubScene(scene, Path.GetDirectoryName(scene.path), $"Subscene", 2, 2, ghost, Vector3.zero);
+            SceneManager.SetActiveScene(scene);
+            using var testWorld = new NetCodeTestWorld();
+            testWorld.Bootstrap(true);
+            testWorld.CreateWorlds(true, 1);
+            SubSceneHelper.LoadSubSceneInWorlds(testWorld);
+
+            var serverRelevancyQuery = testWorld.ServerWorld.EntityManager.CreateEntityQuery(typeof(GhostRelevancy));
+            var clientPrespawnSceneQuery = testWorld.ClientWorlds[0].EntityManager.CreateEntityQuery(typeof(PrespawnSceneLoaded));
+            testWorld.ServerWorld.EntityManager.CompleteAllTrackedJobs(); // to access the relevancy set
+            var relevancy = serverRelevancyQuery.GetSingletonRW<GhostRelevancy>();
+            relevancy.ValueRW.GhostRelevancyMode = GhostRelevancyMode.SetIsRelevant;
+
+            // Test empty relevancy, so no ghosts should be relevant, except the internal prespawn tracking one
+            relevancy.ValueRW.GhostRelevancySet.Clear();
+            // Need to connect after relevancy is set to make sure we cover all cases and ghosts didn't get time to replicate by accident
+            testWorld.Connect();
+            testWorld.GoInGame();
+
+            for (int i = 0; i < 4; i++)
+            {
+                testWorld.Tick();
+            }
+
+            Assert.That(clientPrespawnSceneQuery.CalculateEntityCount(), Is.EqualTo(1));
+
+            // Test set always relevant query to not include prespawn ghost and make sure it is still relevant
+            relevancy = serverRelevancyQuery.GetSingletonRW<GhostRelevancy>();
+            relevancy.ValueRW.DefaultRelevancyQuery = new EntityQueryBuilder(Allocator.Temp).WithNone<PrespawnSceneLoaded>().Build(testWorld.ServerWorld.EntityManager);
+            for (int i = 0; i < 4; i++)
+            {
+                testWorld.Tick();
+            }
+            Assert.That(clientPrespawnSceneQuery.CalculateEntityCount(), Is.EqualTo(1));
+
+            // test that prespawned ghosts are spawned correctly
+            Assert.That(testWorld.ServerWorld.EntityManager.CreateEntityQuery(typeof(GhostInstance), typeof(LocalTransform)).CalculateEntityCount(), Is.EqualTo(4));
+            Assert.That(testWorld.ClientWorlds[0].EntityManager.CreateEntityQuery(typeof(GhostInstance), typeof(LocalTransform)).CalculateEntityCount(), Is.EqualTo(4));
         }
     }
 }
