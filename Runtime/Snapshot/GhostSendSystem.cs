@@ -67,15 +67,6 @@ namespace Unity.NetCode
         public const uint MaxBaselineAge = 1u<<28;
     }
 
-    internal readonly partial struct AspectPacket : IAspect
-    {
-        public readonly Entity Entity;
-        public readonly RefRO<NetworkId> Id;
-        public readonly RefRW<EnablePacketLogging> EnablePacketLogging;
-        public readonly RefRO<NetworkStreamConnection> Connection;
-        public readonly RefRO<NetworkStreamInGame> InGame;
-    }
-
 #if UNITY_EDITOR
     internal struct GhostSendSystemAnalyticsData : IComponentData
     {
@@ -1811,21 +1802,21 @@ namespace Unity.NetCode
                 NetDebugInterop.GetTimestamp(out packetDumpTimestamp);
                 FixedString128Bytes worldNameFixed = state.WorldUnmanaged.Name;
 
-                foreach (var packet in SystemAPI.Query<AspectPacket>())
+                foreach (var (id, entity) in SystemAPI.Query<RefRO<NetworkId>>().WithAll<EnablePacketLogging,NetworkStreamConnection,NetworkStreamInGame>().WithEntityAccess())
                 {
-                    if (!m_ConnectionStateLookup.ContainsKey(packet.Entity))
+                    if (!m_ConnectionStateLookup.ContainsKey(entity))
                         continue;
 
-                    var conState = m_ConnectionStates[m_ConnectionStateLookup[packet.Entity]];
+                    var conState = m_ConnectionStates[m_ConnectionStateLookup[entity]];
                     if (conState.NetDebugPacket.IsCreated)
                         continue;
 
-                    NetDebugInterop.InitDebugPacketIfNotCreated(ref conState.NetDebugPacket, m_LogFolder, worldNameFixed, packet.Id.ValueRO.Value);
-                    m_ConnectionStates[m_ConnectionStateLookup[packet.Entity]] = conState;
+                    NetDebugInterop.InitDebugPacketIfNotCreated(ref conState.NetDebugPacket, m_LogFolder, worldNameFixed, id.ValueRO.Value);
+                    m_ConnectionStates[m_ConnectionStateLookup[entity]] = conState;
                     // Find connection state in the list sent to the serialize job and replace with this updated version
                     for (int i = 0; i < connectionsToProcess.Length; ++i)
                     {
-                        if (connectionsToProcess[i].Entity != packet.Entity)
+                        if (connectionsToProcess[i].Entity != entity)
                         {
                             continue;
                         }
