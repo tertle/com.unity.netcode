@@ -14,6 +14,23 @@ namespace Unity.NetCode
     {}
 
     /// <summary>
+    /// The unique ID assigned to the connection entity in this world, to be sent to the server in case of re-connects.
+    /// It needs to be a separate singleton entity as the connection entity itself will be destroyed during disconnect.
+    /// </summary>
+    struct ConnectionUniqueId : IComponentData
+    {
+        public uint Value;
+    }
+
+#if ENABLE_HOST_MIGRATION
+    /// <summary>
+    /// This tag is added to connections which have been reconnected (client reconnects to a server after diconnecting).
+    /// It is added on both the server and client side.
+    /// </summary>
+    public struct NetworkStreamIsReconnected : IComponentData { }
+#endif
+
+    /// <summary>
     /// The connection identifier assigned by the server to the incoming client connection.
     /// The NetworkIdComponent is used as temporary client identifier for the current session. When a client disconnects,
     /// its network id can be reused by the server, and assigned to a new, incoming connection (on a a "first come, first serve" basis).
@@ -94,11 +111,22 @@ namespace Unity.NetCode
                 return;
             }
 
-            // Create a temporary unique ID component with the server assigned value
-            // The singleton ConnectionUniqueId component might already exist so we'll apply it delayed
-            // TODO: Could pass a component reference via the RPC parameters, then this intermediary component isn't needed
-            var uniqueIdEntity = parameters.CommandBuffer.CreateEntity(parameters.JobIndex);
-            parameters.CommandBuffer.AddComponent(parameters.JobIndex, uniqueIdEntity, new NewConnectionUniqueId() {Value = rpcData.UniqueId});
+            // Set the connection unique ID as commanded by the server
+            if (parameters.ClientConnectionUniqueIdEntity == Entity.Null)
+            {
+                var uniqueIdEntity = parameters.CommandBuffer.CreateEntity(parameters.JobIndex);
+                parameters.CommandBuffer.AddComponent(parameters.JobIndex, uniqueIdEntity, new ConnectionUniqueId() {Value = rpcData.UniqueId});
+            }
+            else
+            {
+                parameters.CommandBuffer.SetComponent(parameters.JobIndex, parameters.ClientConnectionUniqueIdEntity, new ConnectionUniqueId() { Value = rpcData.UniqueId });
+#if ENABLE_HOST_MIGRATION
+                if (parameters.ClientCurrentConnectionUniqueId == rpcData.UniqueId)
+                {
+                    parameters.CommandBuffer.AddComponent<NetworkStreamIsReconnected>(parameters.JobIndex, parameters.Connection);
+                }
+#endif
+            }
 
             parameters.CommandBuffer.AddComponent<ConnectionApproved>(parameters.JobIndex, parameters.Connection);
             parameters.CommandBuffer.AddComponent(parameters.JobIndex, parameters.Connection, new NetworkId {Value = rpcData.NetworkId});

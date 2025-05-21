@@ -122,26 +122,6 @@ namespace Unity.NetCode
             }
             return previousIndex;
         }
-        /// <summary>
-        /// Determine it the latest snapshot received by the server has not changes (all changemasks were 0).
-        /// </summary>
-        /// <param name="buffer"></param>
-        /// <param name="numChangeUints"></param>
-        /// <returns>True if the snapshot has no changes, false otherwise.</returns>
-        internal unsafe bool WasLatestTickZeroChange(in DynamicBuffer<SnapshotDataBuffer> buffer, int numChangeUints)
-        {
-            if (buffer.Length == 0)
-                return false;
-            byte* snapshotData;
-            snapshotData = (byte*)buffer.GetUnsafeReadOnlyPtr() + LatestIndex * SnapshotSize;
-            uint* changeMask = (uint*)(snapshotData+4);
-            uint anyChange = 0;
-            for (int i = 0; i < numChangeUints; ++i)
-            {
-                anyChange |= changeMask[i];
-            }
-            return (anyChange == 0);
-        }
 
         /// <summary>
         /// Try to find the two closest received ghost snapshots for a given <paramref name="targetTick"/>,

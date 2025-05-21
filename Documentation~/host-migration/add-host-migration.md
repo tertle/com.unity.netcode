@@ -1,5 +1,8 @@
 # Add host migration to your project
 
+> [!NOTE]
+> Host migration is an experimental feature so the API and implementation can change in the future. By default it's not exposed, enable it by adding the `ENABLE_HOST_MIGRATION` define in the __Scripting Define Symbols__ in the __Player__ tab of the project settings.
+
 Understand the requirements, systems, and integrations involved in adding host migration to your project.
 
 | **Topic**                       | **Description**                  |

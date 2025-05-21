@@ -1,5 +1,8 @@
 # Limitations and known issues
 
+> [!NOTE]
+> Host migration is an experimental feature so the API and implementation can change in the future. By default it's not exposed, enable it by adding the `ENABLE_HOST_MIGRATION` define in the __Scripting Define Symbols__ in the __Player__ tab of the project settings.
+
 Understand the limitations and known issues with host migration to implement it most effectively in your project.
 
 ## Limitations

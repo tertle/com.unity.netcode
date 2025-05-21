@@ -12,12 +12,10 @@ using Unity.Entities;
 using Unity.NetCode.LowLevel.Unsafe;
 using Unity.Networking.Transport;
 using Unity.Scenes;
-#if USING_UNITY_SERIALIZATION
-using Unity.Serialization.Binary;
-using Unity.Serialization.Json;
-#endif
 using UnityEngine;
 using Hash128 = Unity.Entities.Hash128;
+
+#if ENABLE_HOST_MIGRATION
 
 namespace Unity.NetCode
 {
@@ -128,7 +126,7 @@ namespace Unity.NetCode
             {
                 // NOTE: Compression needs to be done here as it's not burst compatible and can't be done in the host migration system
                 var compressedGhostData = new NativeList<byte>(ghostData.Length, Allocator.Temp);
-                CompressGhostData(ghostData, compressedGhostData);
+                CompressAndEncodeGhostData(ghostData, compressedGhostData);
                 size = hostData.Length + compressedGhostData.Length + sizeof(int) + sizeof(int);
 
                 // Statistics need to be updated as the recorded value earlier was uncompressed
@@ -142,7 +140,7 @@ namespace Unity.NetCode
         /// <summary>
         /// Compress ghost data using Brotli compression and Base64 encode the result
         /// </summary>
-        internal static unsafe void CompressGhostData(NativeList<byte> ghostData, NativeList<byte> compressedGhostData)
+        internal static unsafe void CompressAndEncodeGhostData(NativeList<byte> ghostData, NativeList<byte> compressedGhostData)
         {
             using var outputStream = new MemoryStream();
             using var compressor = new BrotliStream(outputStream, System.IO.Compression.CompressionLevel.Fastest);
@@ -188,6 +186,7 @@ namespace Unity.NetCode
 
         internal static unsafe bool RestoreConnectionComponentData(NativeArray<HostConnectionData> hostMigrationConnections, EntityManager entityManager, Entity connectionEntity, ConnectionUniqueId uniqueId)
         {
+            entityManager.CompleteAllTrackedJobs(); // For the dynamic component data pointer safety
             for (int j = 0; j < hostMigrationConnections.Length; ++j)
             {
                 var prevConnectionData = hostMigrationConnections[j];
@@ -203,6 +202,11 @@ namespace Unity.NetCode
                         var typeInfo = TypeManager.GetTypeInfo(typeIndex);
                         var chunk = entityManager.GetChunk(connectionEntity);
                         var typeHandle = entityManager.GetDynamicComponentTypeHandle(componentType);
+                        if (!chunk.Has(ref typeHandle))
+                        {
+                            Debug.LogError($"Component {componentType} not found on connection with unique ID {prevConnectionData.UniqueId} entity {connectionEntity.ToFixedString()} while trying to migrate connection component data");
+                            continue;
+                        }
                         var indexInChunk = entityManager.GetStorageInfo(connectionEntity).IndexInChunk;
                         var compSize = typeInfo.SizeInChunk;
                         var offset = indexInChunk * compSize;
@@ -257,7 +261,7 @@ namespace Unity.NetCode
         }
 
         /// <summary>
-        /// Configure the client driver with the given driver constructor and connect to the endpoint.
+        /// Optional helper method to create the client driver with the given driver constructor and connect to the endpoint.
         /// The NetworkDriverStore will be recreated as the client can be switching from a local IPC connection to relay
         /// connection or reversed, the relay data can be set at driver creation time.
         /// </summary>
@@ -281,12 +285,7 @@ namespace Unity.NetCode
             clientDriver.ResetDriverStore(clientWorld.Unmanaged, ref clientDriverStore);
 
             var connectionEntity = clientDriver.Connect(clientWorld.EntityManager, serverEndpoint);
-
-            // Add a tag to the connection to signal that it's reconnected after a migration, other systems can react
-            // to that when it's fully connected, for example to put it back in game.
-            if (connectionEntity != Entity.Null)
-                ClientServerBootstrap.ClientWorld.EntityManager.AddComponent<IsReconnected>(connectionEntity);
-            else
+            if (connectionEntity == Entity.Null)
                 return false;
             return true;
         }
@@ -356,16 +355,21 @@ namespace Unity.NetCode
             spawnedGhostEntityMapData.ValueRW.m_ServerAllocatedGhostIds[1] = hostMigrationData.ValueRO.HostData.NextNewPrespawnGhostId;
 
             world.EntityManager.CreateEntity(ComponentType.ReadOnly<EnableHostMigration>());
+            bool hasPrespawns = false;
+            for (int i = 0; i < hostMigrationData.ValueRO.Ghosts.Ghosts.Length; ++i)
+            {
+                if (hostMigrationData.ValueRO.Ghosts.Ghosts[i].GhostId < 0)
+                {
+                    hasPrespawns = true;
+                    break;
+                }
+            }
+            if (hasPrespawns)
+                world.EntityManager.CreateSingleton<ForcePrespawnListPrefabCreate>();
 
             // Trigger server host migration system
             var requestEntity = world.EntityManager.CreateEntity(ComponentType.ReadOnly<HostMigrationRequest>());
-            var sceneEntities = new NativeArray<Entity>(hostMigrationData.ValueRO.HostData.SubScenes.Length, Allocator.Persistent);
-            for (int i = 0; i < hostMigrationData.ValueRO.HostData.SubScenes.Length; ++i)
-            {
-                Debug.Log($"[HostMigration] Server world loading {hostMigrationData.ValueRO.HostData.SubScenes[i].SubSceneGuid.ToString()}");
-                sceneEntities[i] = SceneSystem.LoadSceneAsync(world.Unmanaged, hostMigrationData.ValueRO.HostData.SubScenes[i].SubSceneGuid);
-            }
-            world.EntityManager.SetComponentData(requestEntity, new HostMigrationRequest(){ServerSubScenes = sceneEntities, ExpectedPrefabCount = hostMigrationData.ValueRW.Ghosts.GhostPrefabs.Length});
+            world.EntityManager.SetComponentData(requestEntity, new HostMigrationRequest(){ExpectedPrefabCount = hostMigrationData.ValueRW.Ghosts.GhostPrefabs.Length});
             world.EntityManager.CreateEntity(ComponentType.ReadOnly<HostMigrationInProgress>());
         }
 
@@ -590,6 +594,8 @@ namespace Unity.NetCode
                 {
                     var typeInfo = TypeManager.GetTypeInfo(componentType.TypeIndex);
                     var typeHandle = entityManager.GetDynamicComponentTypeHandle(componentType);
+                    if (!chunk.Has(ref typeHandle))
+                        continue;
                     if (componentType.IsComponent)
                     {
                         var compSize = typeInfo.SizeInChunk;
@@ -636,51 +642,6 @@ namespace Unity.NetCode
 
         internal static unsafe GhostStorage DecodeGhostData(EntityManager entityManger, NativeSlice<byte> data)
         {
-#if USING_UNITY_SERIALIZATION
-            using var configQuery = entityManger.CreateEntityQuery(ComponentType.ReadOnly<HostMigrationConfig>());
-            var config = configQuery.GetSingleton<HostMigrationConfig>();
-            if (config.StorageMethod == DataStorageMethod.JsonMinified || config.StorageMethod == DataStorageMethod.Json)
-            {
-                var minified = config.StorageMethod == DataStorageMethod.JsonMinified;
-                var parameters = new JsonSerializationParameters
-                {
-                    UserDefinedAdapters = new List<IJsonAdapter>
-                    {
-                        new NativeArrayAdapter<GhostData>(),
-                        new NativeArrayAdapter<GhostPrefabData>(),
-                        new NativeArrayAdapter<byte>(),
-                        new NetworkTickAdapter(),
-                    },
-                    Minified = minified
-                };
-                var dataPtr = (sbyte*)data.GetUnsafePtr();
-                return JsonSerialization.FromJson<GhostStorage>(new string(dataPtr), parameters);
-            }
-
-            if (config.StorageMethod == DataStorageMethod.Binary)
-            {
-                var parameters = new BinarySerializationParameters()
-                {
-                    UserDefinedAdapters = new List<IBinaryAdapter>
-                    {
-                        new NativeArrayBinaryAdapter<byte>(),
-                        new NativeArrayBinaryAdapter<GhostPrefabData>(),
-                        new NativeArrayBinaryAdapter<GhostData>(),
-                        new NetworkTickBinaryAdapter()
-                    }
-                };
-
-                var dataPtr = (sbyte*)data.GetUnsafePtr();
-                var decoded = Convert.FromBase64String(new string(dataPtr));
-                fixed (byte* ptr = &decoded[0])
-                {
-                    using var stream = new UnsafeAppendBuffer(ptr, decoded.Length);
-                    stream.ResizeUninitialized(decoded.Length);
-                    var bufferReader = stream.AsReader();
-                    return BinarySerialization.FromBinary<GhostStorage>(&bufferReader, parameters);
-                }
-            }
-#endif
             return DecompressGhostData(data);
         }
 
@@ -732,29 +693,13 @@ namespace Unity.NetCode
                 };
                 newGhostData.SpawnTick.SerializedData = spawnTick;
                 ghostData.Ghosts[i] = newGhostData;
-                
+
             }
             return ghostData;
         }
 
         internal static unsafe HostDataStorage DecodeHostData(NativeSlice<byte> data)
         {
-// #if USING_UNITY_SERIALIZATION
-//             var parameters = new JsonSerializationParameters
-//             {
-//                 UserDefinedAdapters = new List<IJsonAdapter>
-//                 {
-//                     new NativeArrayAdapter<ulong>(),
-//                     new NativeArrayAdapter<byte>(),
-//                     new NativeArrayAdapter<HostConnectionData>(),
-//                     new NativeArrayAdapter<HostSubSceneData>(),
-//                     new NativeArrayAdapter<GhostData>(),
-//                     new NativeArrayAdapter<ConnectionComponent>()
-//                 }
-//             };
-//             var dataPtr = (sbyte*)data.GetUnsafePtr();
-//             return JsonSerialization.FromJson<HostDataStorage>(new string(dataPtr), parameters);
-// #else
             if (data.Length == 0)
             {
                 Debug.LogError("Empty buffer given when decoding host data.");
@@ -795,7 +740,7 @@ namespace Unity.NetCode
                     Components = components
                 };
             }
-            hostData.Connections = connections;;
+            hostData.Connections = connections;
 
             var subsceneCount = reader.ReadShort();
             var subscenes = new NativeArray<HostSubSceneData>(subsceneCount, Allocator.Persistent);
@@ -815,86 +760,8 @@ namespace Unity.NetCode
             hostData.NextNewGhostId = reader.ReadInt();
             hostData.NextNewPrespawnGhostId = reader.ReadInt();
             return hostData;
-// #endif
         }
     }
-
-#if USING_UNITY_SERIALIZATION
-    class NativeArrayAdapter<T> : IJsonAdapter<NativeArray<T>> where T : struct
-    {
-        public void Serialize(in JsonSerializationContext<NativeArray<T>> context, NativeArray<T> value)
-        {
-            using (context.Writer.WriteArrayScope())
-            {
-                for (var i = 0; i < value.Length; i++)
-                {
-                    context.SerializeValue(value[i]);
-                }
-            }
-        }
-
-        public NativeArray<T> Deserialize(in JsonDeserializationContext<NativeArray<T>> context)
-        {
-            var array = context.SerializedValue.AsArrayView();
-            // TODO: Maybe ref can be used instead and avoid another allocation here
-            var value = new NativeArray<T>(array.Count(), Allocator.Persistent);
-
-            var index = 0;
-            foreach (var element in array)
-                value[index++] = context.DeserializeValue<T>(element);
-
-            return value;
-        }
-    }
-
-    class NativeArrayBinaryAdapter<T> : IBinaryAdapter<NativeArray<T>> where T : unmanaged
-    {
-        public unsafe void Serialize(in BinarySerializationContext<NativeArray<T>> context, NativeArray<T> value)
-        {
-            context.Writer->AddArray<T>(value.GetUnsafePtr(), value.Length);
-        }
-
-        public unsafe NativeArray<T> Deserialize(in BinaryDeserializationContext<NativeArray<T>> context)
-        {
-            var srcPtr = context.Reader->ReadNextArray<T>(out var length);
-            // TODO: Maybe ref can be used instead and avoid another allocation here
-            var list = new NativeList<T>(length, Allocator.Persistent);
-            list.ResizeUninitialized(length);
-            UnsafeUtility.MemCpy(list.GetUnsafePtr(), srcPtr, length*sizeof(T));
-            return list.AsArray();
-        }
-    }
-
-    class NetworkTickAdapter : IJsonAdapter<NetworkTick>
-    {
-        public void Serialize(in JsonSerializationContext<NetworkTick> context, NetworkTick value)
-        {
-            context.Writer.WriteValue(value.SerializedData);
-        }
-
-        public NetworkTick Deserialize(in JsonDeserializationContext<NetworkTick> context)
-        {
-            var networkTick = new NetworkTick();
-            networkTick.SerializedData = (uint)context.SerializedValue.AsUInt64();
-            return networkTick;
-        }
-    }
-
-    class NetworkTickBinaryAdapter : IBinaryAdapter<NetworkTick>
-    {
-        public unsafe void Serialize(in BinarySerializationContext<NetworkTick> context, NetworkTick value)
-        {
-            context.Writer->Add(value.SerializedData);
-        }
-
-        public unsafe NetworkTick Deserialize(in BinaryDeserializationContext<NetworkTick> context)
-        {
-            var networkTick = new NetworkTick();
-            uint nt = 0;
-            context.Reader->ReadNext<uint>(out nt);
-            networkTick.SerializedData = nt;
-            return networkTick;
-        }
-    }
-#endif
 }
+
+#endif // ENABLE_HOST_MIGRATION

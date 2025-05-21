@@ -1,23 +1,26 @@
 {
   "name": "com.unity.netcode",
   "displayName": "Netcode for Entities",
-  "version": "1.5.0-exp.101",
+  "version": "1.5.1",
   "unity": "2022.3",
-  "unityRelease": "11f1",
+  "unityRelease": "20f1",
   "description": "Unity's Data Oriented Technology Stack (DOTS) multiplayer netcode layer - a high level netcode system built on entities. This package provides a foundation for creating networked multiplayer applications within DOTS.",
   "dependencies": {
     "com.unity.transport": "2.4.0",
-    "com.unity.entities": "1.3.9",
+    "com.unity.entities": "1.3.5",
     "com.unity.modules.animation": "1.0.0"
   },
-  "repository": {
-    "revision": "ccffebe46fcafcd06d15d77040d6e6652d6109f6",
-    "type": "git",
-    "url": "https://github.cds.internal.unity3d.com/unity/dots.git"
+  "_upm": {
+    "changelog": "### Added\n\n* Experimental host migration feature added, enabled with the ENABLE_HOST_MIGRATION define but otherwise hidden.\n* With ENABLE_HOST_MIGRATION defined, when a client reconnects to a server after disconnecting the connection entity on both sides will receive a `NetworkStreamIsReconnected` component. An internal unique ID is added to connections to track this behaviour.\n\n### Changed\n\n* IsReconnected split into NetworkStreamIsReconnected for reconnected connections and IsMigrated for re-spawned ghosts (Host Migration).\n\n### Fixed\n\n* An issue with Mutiplayer PlayModeTool window, throwing exceptions when docked after a domain reload. The issue was due to because of an access to `EditorPrefs` and `Application.productName` while restoring the window state.\n* Issue where, during host migration, ghosts could be migrated with a 0 id and type. Causing various issues when instantiated on the new host.\n* Crash which could happen after host migrations when the server is deploying the host migration data.\n* Issue with prespawn prefab entity list initialization after a host migration, the ordering of the prespawn ghosts could be shifted by one because of the internal `PrespawnSceneList` entity prefab creation. This would result in *invalid ghost type X (expected X+1)* off by one style errors."
+  },
+  "upmCi": {
+    "footprint": "85ad8686d21c52f5bc985e9c673a9186b755e260"
   },
   "documentationUrl": "https://docs.unity3d.com/Packages/com.unity.netcode@1.5/manual/index.html",
-  "_upm": {
-    "changelog": "### Fixed\n\n* Fix broken link in the documentation."
+  "repository": {
+    "url": "https://github.cds.internal.unity3d.com/unity/dots.git",
+    "type": "git",
+    "revision": "ef945655b154594d85423f41666e7db0d51c3112"
   },
-  "_fingerprint": "0f2dc8587fe31a940429b5e2c06ed67c7eb20f6b"
+  "_fingerprint": "3febe9d26bb9e25ccfc18738571a38a83102c001"
 }

@@ -164,11 +164,18 @@ namespace Unity.NetCode
                 // If the client is reporting a unique connection ID it means it is reconnecting, this is assigned to the
                 // connection entity of the client on the server. When assigning new unique IDs later the server will see
                 // the client already has one and skips it.
-                if (parameters.IsServer && rpcData.ConnectionUniqueId != 0)
+                if (rpcData.ConnectionUniqueId != 0)
                 {
-                    parameters.CommandBuffer.AddComponent(parameters.JobIndex, parameters.Connection, new ConnectionUniqueId() { Value = rpcData.ConnectionUniqueId });
-                    parameters.CommandBuffer.AddComponent<IsReconnected>(parameters.JobIndex, parameters.Connection);
-                    parameters.CommandBuffer.AddComponent<MigrateComponents>(parameters.JobIndex, parameters.Connection);
+                    if (parameters.IsServer)
+                    {
+                        parameters.CommandBuffer.AddComponent(parameters.JobIndex, parameters.Connection, new ConnectionUniqueId() { Value = rpcData.ConnectionUniqueId });
+#if ENABLE_HOST_MIGRATION
+                        parameters.CommandBuffer.AddComponent<MigrateComponents>(parameters.JobIndex, parameters.Connection);
+#endif
+                    }
+#if ENABLE_HOST_MIGRATION
+                    parameters.CommandBuffer.AddComponent<NetworkStreamIsReconnected>(parameters.JobIndex, parameters.Connection);
+#endif
                 }
                 return;
             }

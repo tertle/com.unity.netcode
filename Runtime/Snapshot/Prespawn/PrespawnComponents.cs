@@ -36,6 +36,14 @@ namespace Unity.NetCode
     }
 
     /// <summary>
+    /// Force the creation of the PrespawnSceneList entity prefab instead of waiting for an entity
+    /// scene with prespawned ghosts inside to be loaded.
+    /// </summary>
+    internal struct ForcePrespawnListPrefabCreate : IComponentData
+    {
+    }
+
+    /// <summary>
     /// Added during conversion to all subscenes that contains pre-spawned ghosts.
     /// </summary>
     public struct SubSceneWithPrespawnGhosts : IComponentData
@@ -102,7 +110,7 @@ namespace Unity.NetCode
     /// optimization.
     /// InternalBufferCapacity allocated to almost max out chunk memory.
     /// </summary>
-    [InternalBufferCapacity(600)]
+    [InternalBufferCapacity(0)]
     [GhostComponent(PrefabType = GhostPrefabType.All)]
     internal struct PrespawnSceneLoaded : IBufferElementData
     {
@@ -130,7 +138,7 @@ namespace Unity.NetCode
     /// to a scene that contains prespawned ghosts.
     /// InternalBufferCapacity is set to (approximately) max out the chunk.
     /// </summary>
-    [InternalBufferCapacity(950)]
+    [InternalBufferCapacity(0)]
     internal struct PrespawnGhostIdRange : IBufferElementData
     {
         //the scene for witch the range apply to

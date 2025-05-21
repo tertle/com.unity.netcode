@@ -1,5 +1,8 @@
 # Host migration API and components
 
+> [!NOTE]
+> Host migration is an experimental feature so the API and implementation can change in the future. By default it's not exposed, enable it by adding the `ENABLE_HOST_MIGRATION` define in the __Scripting Define Symbols__ in the __Player__ tab of the project settings.
+
 Understand the host migration API, components, and component options.
 
 ## Host migration API
@@ -16,7 +19,7 @@ Understand the host migration API, components, and component options.
 
 | Components | Description |
 |-|-|
-| `IsReconnected` | This component is added to all connections on clients and the server so that they can react to being reconnected. The spawned ghosts on the new host also receive this component, so if there are any fixes needed you can query against this component. |
+| `NetworkStreamIsReconnected` | This component is added to all connections on clients and the server so that they can react to being reconnected. The spawned ghosts on the new host also receive this component, so if there are any fixes needed you can query against this component. |
 | `EnableHostMigration` | Enable the host migration system. When enabled, the system collects host migration data at the interval specified in `HostMigrationConfig`, and updates the last update time in `HostMigrationStats`. |
 | `HostMigrationInProgress` | This component is used to detect when a host migration is in progress and when it's complete. |
 | `HostMigrationConfig` | A singleton component that exposes a few options to modify in the host migration system. |

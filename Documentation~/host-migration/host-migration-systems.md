@@ -1,5 +1,8 @@
 # Host migration systems and data
 
+> [!NOTE]
+> Host migration is an experimental feature so the API and implementation can change in the future. By default it's not exposed, enable it by adding the `ENABLE_HOST_MIGRATION` define in the __Scripting Define Symbols__ in the __Player__ tab of the project settings.
+
 Set up host migration systems in your project to enable host migration in a client hosted networking experience.
 
 Netcode for Entities contains [APIs](host-migration-api.md) for gathering host migration data into a buffer, which can then be used with the Multiplayer Services SDK to upload to the host migration service, and for deploying this data to a new server after a migration.
@@ -55,7 +58,7 @@ if (!HostMigration.MigrateDataToNewServerWorld(driverConstructor, ref arrayData)
 
 ## Connect clients to the new host
 
-After a host migration event every client needs to connect to the new host (except the client that became the new host). To do this, each client needs to recreate the network driver in the client world to set up the new relay allocation from the new host. There's a helper function called `HostMigration.ConfigureClientAndConnect` which makes this task simpler and tags the new connection with the `IsReconnected` component.
+After a host migration event every client needs to connect to the new host (except the client that became the new host). To do this, each client needs to recreate the network driver in the client world to set up the new relay allocation from the new host. There's a helper function called `HostMigration.ConfigureClientAndConnect` which makes this task simpler and tags the new connection with the `NetworkStreamIsReconnected` component.
 
 ```
 var allocation = await RelayService.Instance.JoinAllocationAsync(newJoinCode);

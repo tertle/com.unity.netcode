@@ -2,6 +2,7 @@
 #define NETCODE_DEBUG
 #endif
 using System;
+using System.Diagnostics;
 using System.Runtime.InteropServices;
 using Unity.Burst;
 using Unity.Burst.CompilerServices;
@@ -13,7 +14,7 @@ using Unity.Mathematics;
 using Unity.NetCode.LowLevel.Unsafe;
 using Unity.Networking.Transport;
 using Unity.Profiling;
-using UnityEngine;
+using Debug = UnityEngine.Debug;
 
 namespace Unity.NetCode
 {
@@ -65,6 +66,7 @@ namespace Unity.NetCode
         EntityQuery m_ConnectionRequestConnectQuery;
         ComponentLookup<ConnectionState> m_ConnectionStateFromEntity;
 
+        /// <inheritdoc/>
         [BurstCompile]
         public void OnCreate(ref SystemState state)
         {
@@ -74,6 +76,7 @@ namespace Unity.NetCode
             state.RequireForUpdate<NetDebug>();
         }
 
+        /// <inheritdoc/>
         [BurstCompile]
         public void OnUpdate(ref SystemState systemState)
         {
@@ -135,6 +138,8 @@ namespace Unity.NetCode
     {
         EntityQuery m_ConnectionRequestListenQuery;
         ComponentLookup<NetworkStreamRequestListenResult> m_ConnectionStateFromEntity;
+
+        /// <inheritdoc/>
         public void OnCreate(ref SystemState state)
         {
             m_ConnectionRequestListenQuery = state.GetEntityQuery(ComponentType.ReadWrite<NetworkStreamRequestListen>());
@@ -142,6 +147,8 @@ namespace Unity.NetCode
             state.RequireForUpdate<NetworkStreamDriver>();
             state.RequireForUpdate<NetDebug>();
         }
+
+        /// <inheritdoc/>
         public void OnUpdate(ref SystemState systemState)
         {
             var netDebug = SystemAPI.GetSingleton<NetDebug>();
@@ -264,12 +271,13 @@ namespace Unity.NetCode
         }
 
         ref NetworkDriverStore DriverStore => ref UnsafeUtility.AsRef<NetworkStreamDriver.Pointers>((void*)m_DriverPointers).DriverStore;
-        NativeReference<Mathematics.Random> m_Random;
+        NativeReference<uint> m_RandomIndex;
         NativeReference<int> m_NumNetworkIds;
         NativeQueue<int> m_FreeNetworkIds;
         RpcQueue<ServerApprovedConnection, ServerApprovedConnection> m_ServerApprovedConnectionRpcQueue;
         RpcQueue<RequestProtocolVersionHandshake, RequestProtocolVersionHandshake> m_RequestProtocolVersionHandshakeRpcQueue;
         RpcQueue<ServerRequestApprovalAfterHandshake,ServerRequestApprovalAfterHandshake> m_ServerRequestApprovalRpcQueue;
+        NativeList<uint> m_ConnectionUniqueIds;
 
         EntityQuery m_RefreshTickRateQuery;
 
@@ -289,6 +297,7 @@ namespace Unity.NetCode
         NativeList<NetCodeConnectionEvent> m_ConnectionEvents;
         private NetworkPipelineStageId m_reliableSequencedPipelineStageId;
 
+        /// <inheritdoc/>
         public void OnCreate(ref SystemState state)
         {
             DriverMigrationSystem driverMigrationSystem = default;
@@ -298,11 +307,12 @@ namespace Unity.NetCode
                     break;
             }
 
-            m_Random = new NativeReference<Mathematics.Random>(Allocator.Persistent);
-            m_Random.Value = new Mathematics.Random((uint)System.Diagnostics.Stopwatch.GetTimestamp());
+            m_RandomIndex = new NativeReference<uint>(Allocator.Persistent);
+            m_RandomIndex.Value = (uint)System.Diagnostics.Stopwatch.GetTimestamp();
             m_NumNetworkIds = new NativeReference<int>(Allocator.Persistent);
             m_FreeNetworkIds = new NativeQueue<int>(Allocator.Persistent);
             m_ConnectionEvents = new NativeList<NetCodeConnectionEvent>(32, Allocator.Persistent);
+            m_ConnectionUniqueIds = new NativeList<uint>(16, Allocator.Persistent);
 
             var rpcCollection = SystemAPI.GetSingleton<RpcCollection>();
             m_ServerApprovedConnectionRpcQueue = rpcCollection.GetRpcQueue<ServerApprovedConnection>();
@@ -361,12 +371,14 @@ namespace Unity.NetCode
             m_RefreshTickRateQuery = state.GetEntityQuery(builder);
         }
 
+        /// <inheritdoc/>
         public void OnDestroy(ref SystemState state)
         {
-            m_Random.Dispose();
+            m_RandomIndex.Dispose();
             m_NumNetworkIds.Dispose();
             m_FreeNetworkIds.Dispose();
             m_ConnectionEvents.Dispose();
+            m_ConnectionUniqueIds.Dispose();
 
             ref readonly var networkStreamDriver = ref SystemAPI.GetSingletonRW<NetworkStreamDriver>().ValueRO;
             if (DriverState.Default == networkStreamDriver.DriverState)
@@ -389,6 +401,7 @@ namespace Unity.NetCode
             }
         }
 
+        /// <inheritdoc/>
         [BurstCompile]
         public void OnUpdate(ref SystemState state)
         {
@@ -445,8 +458,8 @@ namespace Unity.NetCode
             k_Scheduling.End();
 
             ref var networkStreamDriver = ref SystemAPI.GetSingletonRW<NetworkStreamDriver>().ValueRW;
-            SystemAPI.TryGetSingleton<ClientServerTickRate>(out var clientServerTickRate);
-            clientServerTickRate.ResolveDefaults();
+            SystemAPI.TryGetSingleton<ClientServerTickRate>(out var tickRate);
+            tickRate.ResolveDefaults();
             var timestampMS = NetworkTimeSystem.TimestampMS;
 
             if (driverListening)
@@ -466,7 +479,7 @@ namespace Unity.NetCode
                     netDebug = netDebug,
                     debugPrefix = debugPrefix,
                     currentTime = timestampMS,
-                    tickRate = clientServerTickRate,
+                    tickRate = tickRate,
                     requireConnectionApproval = networkStreamDriver.RequireConnectionApproval ? (byte) 1 : (byte) 0,
                 };
                 k_Scheduling.Begin();
@@ -477,7 +490,7 @@ namespace Unity.NetCode
             {
                 if (!m_RefreshTickRateQuery.IsEmptyIgnoreFilter)
                 {
-                    if (!SystemAPI.TryGetSingleton<ClientServerTickRate>(out var tickRate))
+                    if (!SystemAPI.TryGetSingleton(out tickRate))
                         state.EntityManager.CreateSingleton(tickRate);
                     tickRate.ResolveDefaults();
                     var requests = m_RefreshTickRateQuery.ToComponentDataArray<ClientServerTickRateRefreshRequest>(Allocator.Temp);
@@ -491,6 +504,9 @@ namespace Unity.NetCode
                 }
                 m_FreeNetworkIds.Clear();
             }
+
+            // Keep the index incrementing with some added randomeness via server tick. The random generated outputs will never collide with previous outputs
+            m_RandomIndex.Value += networkTime.ServerTick.SerializedData;
 
             // This singleton will only exist on clients as it's used to keep track of this value between connection destroy/recreate
             uint clientConnectionUniqueId = 0;
@@ -527,6 +543,7 @@ namespace Unity.NetCode
                 enablePacketLoggingFromEntity = m_EnablePacketLoggingFromEntity,
                 freeNetworkIds = m_FreeNetworkIds,
                 connectionEvents = m_ConnectionEvents,
+                connectionUniqueIds = m_ConnectionUniqueIds,
 
                 outgoingRpcBuffer = m_OutgoingRpcBufferFromEntity,
                 rpcBuffer = m_RpcBufferFromEntity,
@@ -538,8 +555,8 @@ namespace Unity.NetCode
                 protocolVersion = networkProtocolVersion,
                 localTime = timestampMS,
                 lastServerTick = networkTime.ServerTick,
-                tickRate = clientServerTickRate,
-                random = m_Random,
+                tickRate = tickRate,
+                randomIndex = m_RandomIndex,
                 clientConnectionUniqueId = clientConnectionUniqueId,
                 numNetworkId = m_NumNetworkIds,
                 connectionApprovedLookup = m_ApprovedFromEntity,
@@ -656,6 +673,7 @@ namespace Unity.NetCode
             public ComponentLookup<EnablePacketLogging> enablePacketLoggingFromEntity;
             public NativeQueue<int> freeNetworkIds;
             public NativeList<NetCodeConnectionEvent> connectionEvents;
+            public NativeList<uint> connectionUniqueIds;
 
             public BufferLookup<OutgoingRpcDataStreamBuffer> outgoingRpcBuffer;
             public BufferLookup<IncomingRpcDataStreamBuffer> rpcBuffer;
@@ -672,7 +690,7 @@ namespace Unity.NetCode
 
             // Stuff for Approval:
             public uint clientConnectionUniqueId;
-            public NativeReference<Mathematics.Random> random;
+            public NativeReference<uint> randomIndex;
             public NativeReference<int> numNetworkId;
             public RpcQueue<ServerApprovedConnection, ServerApprovedConnection> serverApprovedConnectionRpcQueue;
             public RpcQueue<ServerRequestApprovalAfterHandshake, ServerRequestApprovalAfterHandshake> serverRequestApprovalRpcQueue;
@@ -695,7 +713,6 @@ namespace Unity.NetCode
                 }
                 else if (!inGameFromEntity.HasComponent(entity))
                 {
-                    // Reset almost all NetworkSnapshotAck fields:
                     snapshotAck = new NetworkSnapshotAck
                     {
                         LastReceivedRemoteTime = snapshotAck.LastReceivedRemoteTime,
@@ -782,7 +799,7 @@ namespace Unity.NetCode
                                     var buffer = cmdBuffer[entity];
                                     var snapshot = new NetworkTick{SerializedData = reader.ReadUInt()};
                                     uint snapshotMask = reader.ReadUInt();
-                                    snapshotAck.UpdateReceivedByRemote(snapshot, snapshotMask);
+                                    snapshotAck.UpdateReceivedByRemote(snapshot, snapshotMask, out var numSnapshotErrorsRequiringReset);
                                     uint remoteTime = reader.ReadUInt();
                                     uint localTimeMinusRTT = reader.ReadUInt();
                                     uint interpolationDelay = reader.ReadUInt();
@@ -800,6 +817,12 @@ namespace Unity.NetCode
                                     if (!isValidCmdTick || buffer.Length > 0)
                                     {
                                         netStats[2] = netStats[2] + 1;
+                                    }
+                                    if(numSnapshotErrorsRequiringReset != 0)
+                                    {
+                                        var msg = (FixedString512Bytes)$"{connection.Value.ToFixedString()} reported recoverable snapshot read errors. Thus, we have reset their entire ack history. Note: This incurs a bandwidth and CPU cost, as we must resend all relevant ghost chunks again (i.e. as if this was a new joiner).";
+                                        netDebug.LogWarning($"{debugPrefix} {msg}");
+                                        TryLog(in entity, msg);
                                     }
 #endif
                                     // Do not try to process incoming commands which are older than commands we already processed
@@ -828,11 +851,11 @@ namespace Unity.NetCode
                                     // Copy the reader here, as we want to pass the ServerTick into the GhostReceiveSystem,
                                     // and that'll fail if we read too far.
                                     var copyOfReader = reader;
-                                    var newServerTick = new NetworkTick{SerializedData = copyOfReader.ReadUInt()};
+                                    var currentSnapshotServerTick = new NetworkTick{SerializedData = copyOfReader.ReadUInt()};
 
                                     // Skip old snapshots:
-                                    var isValid = !snapshotAck.LastReceivedSnapshotByLocal.IsValid || newServerTick.IsNewerThan(snapshotAck.LastReceivedSnapshotByLocal);
-                                    UpdatePacketLossStats(ref snapshotAck.SnapshotPacketLoss, isValid, currentSnapshotSequenceId, ref snapshotAck, in entity, buffer);
+                                    var isValid = !snapshotAck.LastReceivedSnapshotByLocal.IsValid || currentSnapshotServerTick.IsNewerThan(snapshotAck.LastReceivedSnapshotByLocal);
+                                    UpdatePacketLossStats(ref snapshotAck.SnapshotPacketLoss, isValid, currentSnapshotSequenceId, currentSnapshotServerTick, ref snapshotAck, in entity, buffer);
                                     if (!isValid)
                                         break;
                                     //This is partially valid: if we receive 3 packets, it is valid to only ack the last one
@@ -843,14 +866,14 @@ namespace Unity.NetCode
                                         if (buffer.Length > 0)
                                             snapshotAck.ReceivedSnapshotByLocalMask ^= 0x1;
                                         //shift the ack window. It is correct to shift
-                                        var shamt = newServerTick.TicksSince(snapshotAck.LastReceivedSnapshotByLocal);
+                                        var shamt = currentSnapshotServerTick.TicksSince(snapshotAck.LastReceivedSnapshotByLocal);
                                         if (shamt < 32)
                                             snapshotAck.ReceivedSnapshotByLocalMask <<= shamt;
                                         else
                                             snapshotAck.ReceivedSnapshotByLocalMask = 0;
                                     }
                                     snapshotAck.ReceivedSnapshotByLocalMask |= 1;
-                                    snapshotAck.LastReceivedSnapshotByLocal = newServerTick;
+                                    snapshotAck.LastReceivedSnapshotByLocal = currentSnapshotServerTick;
                                     snapshotAck.CurrentSnapshotSequenceId = currentSnapshotSequenceId;
 
                                     // Limitation: Clobber any previous snapshot, even if said snapshot has not been processed yet.
@@ -925,6 +948,19 @@ namespace Unity.NetCode
 
                     if (networkId.Value != default)
                         freeNetworkIds.Enqueue(networkId.Value);
+
+                    if (connectionUniqueIdFromEntity.HasComponent(entity))
+                    {
+                        var cuid = connectionUniqueIdFromEntity[entity].Value;
+                        for (int i = 0; i < connectionUniqueIds.Length; ++i)
+                        {
+                            if (connectionUniqueIds[i] == cuid)
+                            {
+                                connectionUniqueIds.RemoveAtSwapBack(i);
+                                break;
+                            }
+                        }
+                    }
 
                     netDebug.DebugLog($"{debugPrefix} {connection.Value.ToFixedString()} closed NetworkId={networkId.Value} Reason={disconnectReason.ToFixedString()}.");
                     connectionEvents.Add(new NetCodeConnectionEvent
@@ -1055,16 +1091,38 @@ namespace Unity.NetCode
                 bool isReconnecting = false;
                 if (connectionUniqueIdFromEntity.HasComponent(ent))
                 {
-                    connectionUniqueId = connectionUniqueIdFromEntity[ent].Value;
+                    // Only re-assign if the ID isn't already registered
+                    var clientReportedId = connectionUniqueIdFromEntity[ent].Value;
+                    if (!connectionUniqueIds.Contains(clientReportedId))
+                        connectionUniqueId = clientReportedId;
+                    else
+                        Debug.LogWarning($"Client is reporting an already reserved connection unique ID {clientReportedId}. Will generate a new one.");
                     isReconnecting = true;
                 }
-                else
+                if (connectionUniqueId == 0)
                 {
-                    var r = random.Value;
-                    connectionUniqueId = r.NextUInt();
-                    random.Value = r;
-                    commandBuffer.AddComponent(ent, new ConnectionUniqueId(){ Value = connectionUniqueId });
+                    if (randomIndex.Value == uint.MaxValue)
+                        randomIndex.Value = 0;
+                    var random = Mathematics.Random.CreateFromIndex(randomIndex.Value);
+                    connectionUniqueId = random.NextUInt();
+                    int count = 0;
+                    while (connectionUniqueIds.Contains(connectionUniqueId))
+                    {
+                        Debug.LogWarning($"Unique ID collision for ID {connectionUniqueId}, will generate another one.");
+                        randomIndex.Value++;
+                        random = Mathematics.Random.CreateFromIndex(randomIndex.Value);
+                        connectionUniqueId = random.NextUInt();
+                        // Doubtful we'll ever have 100 collisions but just to prevent infinite loops
+                        if (count++ > 100)
+                        {
+                            Debug.LogError($"Failed to generate a non-colliding unique ID for network ID {nid}, unique ID count {connectionUniqueIds.Length}.");
+                            break;
+                        }
+                    }
+                    randomIndex.Value++;
                 }
+                commandBuffer.AddComponent(ent, new ConnectionUniqueId(){ Value = connectionUniqueId });
+                connectionUniqueIds.Add(connectionUniqueId);
 
                 networkId = new NetworkId {Value = nid};
                 commandBuffer.AddComponent(ent, networkId);
@@ -1092,7 +1150,9 @@ namespace Unity.NetCode
             /// Records SnapshotSequenceId [SSId] statistics, detecting packet loss, packet duplication, and out of order packets.
             /// </summary>
             // ReSharper disable once UnusedParameter.Local
-            private void UpdatePacketLossStats(ref SnapshotPacketLossStatistics stats, bool snapshotIsConfirmedNewer, in byte currentSnapshotSequenceId, ref NetworkSnapshotAck snapshotAck, in Entity entity, DynamicBuffer<IncomingSnapshotDataStreamBuffer> buffer)
+            private void UpdatePacketLossStats(ref SnapshotPacketLossStatistics stats, bool snapshotIsConfirmedNewer,
+                in byte currentSnapshotSequenceId, NetworkTick currentSnapshotServerTick, ref NetworkSnapshotAck snapshotAck,
+                in Entity entity, DynamicBuffer<IncomingSnapshotDataStreamBuffer> buffer)
             {
                 if (stats.NumPacketsReceived == 0) snapshotAck.CurrentSnapshotSequenceId = (byte) (currentSnapshotSequenceId - 1);
                 stats.NumPacketsReceived++;
@@ -1106,7 +1166,7 @@ namespace Unity.NetCode
                     {
                         stats.NumPacketsDroppedNeverArrived += (ulong) numDroppedPackets;
 #if NETCODE_DEBUG
-                        TryLog(entity, (FixedString512Bytes)$"[SSId:{currentSnapshotSequenceId}] Inferred {numDroppedPackets} snapshots dropped!");
+                        TryLog(entity, (FixedString512Bytes)$"[SSId:{currentSnapshotSequenceId}, ST:{currentSnapshotServerTick.ToFixedString()}] Inferred {numDroppedPackets} snapshots dropped!");
 #endif
                     }
 
@@ -1115,10 +1175,13 @@ namespace Unity.NetCode
                     {
                         stats.NumPacketsCulledAsArrivedOnSameFrame++;
 #if NETCODE_DEBUG
-                        TryLog(entity, (FixedString512Bytes)$"[SSId:{currentSnapshotSequenceId}] Clobbering previous snapshot, arrived same frame.");
+                        TryLog(entity, (FixedString512Bytes)$"[SSId:{currentSnapshotSequenceId}, ST:{currentSnapshotServerTick.ToFixedString()}] Clobbering previous snapshot, arrived same frame.");
 #endif
                     }
 
+#if NETCODE_DEBUG
+                    TryLog(entity, (FixedString512Bytes)$"[SSId:{currentSnapshotSequenceId}, ST:{currentSnapshotServerTick.ToFixedString()}] Accepted & queued!");
+#endif
                     return;
                 }
 
@@ -1128,7 +1191,7 @@ namespace Unity.NetCode
                     // We can't track any previous duplicate packets (unless we keep an ack history),
                     // so we don't track it at all. Just log.
 #if NETCODE_DEBUG
-                    TryLog(entity, (FixedString512Bytes) $"[SSId:{currentSnapshotSequenceId}] Detected duplicated snapshot packet!");
+                    TryLog(entity, (FixedString512Bytes) $"[SSId:{currentSnapshotSequenceId}, ST:{currentSnapshotServerTick.ToFixedString()}] Detected duplicated snapshot packet!");
 #endif
                     return;
                 }
@@ -1140,17 +1203,19 @@ namespace Unity.NetCode
                 if (stats.NumPacketsDroppedNeverArrived > 0)
                     stats.NumPacketsDroppedNeverArrived--;
 #if NETCODE_DEBUG
-                TryLog(entity, (FixedString512Bytes) $"[SSId:{currentSnapshotSequenceId}] Arrived {Unity.Mathematics.math.abs(sequenceIdDelta)} ServerTicks late!");
+                TryLog(entity, (FixedString512Bytes) $"[SSId:{currentSnapshotSequenceId}, ST:{currentSnapshotServerTick.ToFixedString()}] Culled as arrived {Unity.Mathematics.math.abs(sequenceIdDelta)} ServerTicks late!");
 #endif
             }
 
-#if NETCODE_DEBUG
+
+            [Conditional("NETCODE_DEBUG")]
             private void TryLog(in Entity entity, in FixedString512Bytes msg)
             {
+#if NETCODE_DEBUG
                 if(enablePacketLoggingFromEntity.TryGetComponent(entity, out var comp) && comp.NetDebugPacketCache.IsCreated)
                     comp.NetDebugPacketCache.Log(msg);
-            }
 #endif
+            }
         }
     }
 }

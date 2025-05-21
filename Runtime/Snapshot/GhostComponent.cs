@@ -372,4 +372,15 @@ namespace Unity.NetCode
             return TypeManager.GetTypeInfo(self.TypeIndex).DebugTypeName;
         }
     }
+
+    /// <summary>
+    /// When this component is set on a ghost at instantiation time on the server, the ghost ID and spawn tick
+    /// will be used when initializing the GhostInstance component instead of the normal method (using current server
+    /// tick and highest ghost ID available).
+    /// </summary>
+    internal struct OverrideGhostData : IComponentData
+    {
+        public int GhostId;
+        public NetworkTick SpawnTick;
+    }
 }

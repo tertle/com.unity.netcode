@@ -9,12 +9,10 @@ using Unity.Collections.LowLevel.Unsafe;
 using Unity.Entities;
 using Unity.NetCode.LowLevel.Unsafe;
 using Unity.Scenes;
-#if USING_UNITY_SERIALIZATION
-using Unity.Serialization.Binary;
-using Unity.Serialization.Json;
-#endif
 using Debug = UnityEngine.Debug;
 using Hash128 = Unity.Entities.Hash128;
+
+#if ENABLE_HOST_MIGRATION
 
 namespace Unity.NetCode
 {
@@ -25,11 +23,10 @@ namespace Unity.NetCode
     public struct EnableHostMigration : IComponentData { }
 
     /// <summary>
-    /// This tag is added to connections and ghost entities when they are reconnected or respawned.
+    /// This tag is added to ghost entities on the new server when they have been respawned after a host migration.
     /// </summary>
-    public struct IsReconnected : IComponentData { }
+    public struct IsMigrated : IComponentData { }
 
-    /// <summary>
     /// This component will be present for the duration of a host migration. It can be used when certain
     /// systems or operations should run or not run according to host migration state.
     /// </summary>
@@ -41,24 +38,6 @@ namespace Unity.NetCode
     struct MigrateComponents : IComponentData
     {
         public int Step;
-    }
-
-    /// <summary>
-    /// The unique ID assigned to the connection entity in this world, to be sent to the server in case of re-connects.
-    /// It needs to be a separate singleton entity as the connection entity itself will be destroyed during disconnect.
-    /// </summary>
-    struct ConnectionUniqueId : IComponentData
-    {
-        public uint Value;
-    }
-
-    /// <summary>
-    /// Temporary storage for a newly assigned connection unique ID from the server, the
-    /// value can't be assigned immediately in the RPC where it is received.
-    /// </summary>
-    struct NewConnectionUniqueId : IComponentData
-    {
-        public uint Value;
     }
 
     struct HostMigrationData : IComponentData
@@ -136,21 +115,6 @@ namespace Unity.NetCode
     /// </summary>
     public enum DataStorageMethod : byte
     {
-#if USING_UNITY_SERIALIZATION
-        /// <summary>
-        /// Use the JsonSerialization class from the com.unity.serialization package for storing host migration data.
-        /// </summary>
-        Json,
-        /// <summary>
-        /// Use the JsonSerialization class from the com.unity.serialization package but use the minified option to
-        /// make the text more compact.
-        /// </summary>
-        JsonMinified,
-        /// <summary>
-        /// Use the BinarySerialization class from the com.unity.serialization package for storing host migration data.
-        /// </summary>
-        Binary,
-#endif
         /// <summary>
         /// Serialize data with <see cref="DataStreamWriter"/> and compress into byte array.
         /// </summary>
@@ -227,12 +191,6 @@ namespace Unity.NetCode
         public NativeArray<byte> Data;
     }
 
-    internal struct OverrideGhostData : IComponentData
-    {
-        public int GhostId;
-        public NetworkTick SpawnTick;
-    }
-
     struct HostSubSceneData
     {
         public Hash128 SubSceneGuid;
@@ -283,7 +241,8 @@ namespace Unity.NetCode
     /// monitor the update timer on the data for detecting when new data is ready).
     /// </summary>
     [WorldSystemFilter(WorldSystemFilterFlags.ServerSimulation)]
-    [UpdateInGroup(typeof(GhostSimulationSystemGroup))]
+    [UpdateInGroup(typeof(SimulationSystemGroup), OrderLast = true)]
+    [UpdateAfter(typeof(GhostSendSystem))]  // Send system assigns GhostID/GhostType on new entity instantiations (we need those set/ready in the host migration data)
     [BurstCompile]
     partial struct ServerHostMigrationSystem : ISystem
     {
@@ -309,7 +268,7 @@ namespace Unity.NetCode
             m_HostMigrationCache.ServerOnlyComponentsFlag = new NativeList<int>(64, Allocator.Persistent);
             m_HostMigrationCache.ServerOnlyComponentsPerGhostType = new NativeHashMap<int, NativeList<ComponentType>>(64, Allocator.Persistent);
 
-            m_DefaultComponents = new NativeArray<ComponentType>(15, Allocator.Persistent);
+            m_DefaultComponents = new NativeArray<ComponentType>(16, Allocator.Persistent);
             m_DefaultComponents[0] = ComponentType.ReadOnly<NetworkStreamConnection>();
             m_DefaultComponents[1] = ComponentType.ReadOnly<CommandTarget>();
             m_DefaultComponents[2] = ComponentType.ReadOnly<NetworkId>();
@@ -323,8 +282,9 @@ namespace Unity.NetCode
             m_DefaultComponents[10] = ComponentType.ReadOnly<Simulate>();
             m_DefaultComponents[11] = ComponentType.ReadOnly<ConnectionApproved>();
             m_DefaultComponents[12] = ComponentType.ReadOnly<ConnectionUniqueId>();
-            m_DefaultComponents[13] = ComponentType.ReadOnly<IsReconnected>();
-            m_DefaultComponents[14] = ComponentType.ReadOnly<EnablePacketLogging>();
+            m_DefaultComponents[13] = ComponentType.ReadOnly<NetworkStreamIsReconnected>();
+            m_DefaultComponents[14] = ComponentType.ReadOnly<IsMigrated>();
+            m_DefaultComponents[15] = ComponentType.ReadOnly<EnablePacketLogging>();
 
             m_LastServerUpdate = 0.0;
             m_MigrationTime = 0.0;
@@ -431,6 +391,20 @@ namespace Unity.NetCode
                     foreach (var con in hostMigrationData.HostData.Connections)
                         m_NetworkIdMap.Add(con.UniqueId, con.NetworkId);
                     state.EntityManager.AddComponentData(connectionMapEntity, new ConnectionMap(){UniqueIdToPreviousNetworkId = m_NetworkIdMap});
+                }
+
+                // Start loading the entity scenes as soon as the prespawn list prefab has been created
+                if (migrationRequest.ServerSubScenes.Length == 0 && hostMigrationData.HostData.SubScenes.Length > 0)
+                {
+                    var sceneEntities = new NativeArray<Entity>(hostMigrationData.HostData.SubScenes.Length, Allocator.Persistent);
+                    for (int i = 0; i < hostMigrationData.HostData.SubScenes.Length; ++i)
+                    {
+                        Debug.Log($"[HostMigration] Server world loading {hostMigrationData.HostData.SubScenes[i].SubSceneGuid}");
+                        sceneEntities[i] = SceneSystem.LoadSceneAsync(state.WorldUnmanaged, hostMigrationData.HostData.SubScenes[i].SubSceneGuid);
+                    }
+                    migrationRequest.ServerSubScenes = sceneEntities;
+                    SystemAPI.SetSingleton(migrationRequest);
+                    return;
                 }
 
                 var allLoaded = true;
@@ -547,6 +521,12 @@ namespace Unity.NetCode
                     var collectionEntity = SystemAPI.GetSingletonEntity<GhostCollection>();
                     var buffer = state.EntityManager.GetBuffer<GhostCollectionPrefab>(collectionEntity);
                     entity = state.EntityManager.Instantiate(buffer[ghostType].GhostPrefab);
+
+                    if ( ghost.GhostId == 0 )
+                    {
+                        Debug.LogError($"Received a migrated ghost with an id of 0 this should not be possible. GhostIds are assigned by the GhostSendSystem and this should always run before the migration system ensuring all ghosts have a valid id.");
+                    }
+
                     state.EntityManager.AddComponentData(entity, new OverrideGhostData() { GhostId = ghost.GhostId, SpawnTick = ghost.SpawnTick });
                     migratedGhostIds.Set( ghost.GhostId, true );
                     ghostEntities.Add(entity);
@@ -570,7 +550,7 @@ namespace Unity.NetCode
                 }
 
                 SetGhostComponentData(ref state, entity, ghostType, ghost.Data);
-                state.EntityManager.AddComponent<IsReconnected>(entity);
+                state.EntityManager.AddComponent<IsMigrated>(entity);
             }
 
             // after instancing all the migrated ghosts we have added the override components so we move any unused ids back to the free list
@@ -644,6 +624,12 @@ namespace Unity.NetCode
                 var serializationStrategy = collectionData.GetCurrentSerializationStrategyForComponent(componentType, ghostSerializer.VariantHash, false);
                 var typeHandle = state.EntityManager.GetDynamicComponentTypeHandle(componentType);
 
+                if (!chunk.Has(ref typeHandle))
+                {
+                    Debug.LogError($"Component {componentType} not found on ghost entity {ghostEntity.ToFixedString()} ghost type {ghostType} while trying to migrate ghost component data");
+                    continue;
+                }
+
                 if (componentType.IsEnableable)
                 {
                     byte isSet = 0;
@@ -694,6 +680,11 @@ namespace Unity.NetCode
                     {
                         var typeInfo = TypeManager.GetTypeInfo(componentType.TypeIndex);
                         var typeHandle = state.EntityManager.GetDynamicComponentTypeHandle(componentType);
+                        if (!chunk.Has(ref typeHandle))
+                        {
+                            Debug.LogError($"Component {componentType} not found on server-only ghost entity {ghostEntity.ToFixedString()} ghost type {ghostType} while trying to migrate ghost component data");
+                            continue;
+                        }
                         if (componentType.IsComponent && typeInfo.SizeInChunk != 0)
                         {
                             var compSize = typeInfo.SizeInChunk;
@@ -820,16 +811,6 @@ namespace Unity.NetCode
 
             hostDataBlob.Clear();
 
-            // TODO: The host data must really always be the same method, as it contains the storage method
-            // which is then synchronized to client via the host data. Json might be useful for debugging
-            // but is incompatible with burst so must then always use DataStreamWriter
-// #if USING_UNITY_SERIALIZATION
-//             if (config.StorageMethod != DataStorageMethod.StreamCompressed)
-//             {
-//                 JsonSerializeHostData(hostDataBlob, migrationData);
-//                 return;
-//             }
-// #endif
             var writer = new DataStreamWriter(1024, Allocator.Temp);
             WriteHostData(ref writer);
             while (writer.HasFailedWrites)
@@ -883,40 +864,6 @@ namespace Unity.NetCode
                 dataStreamWriter.WriteInt(migrationData.NextNewPrespawnGhostId);
             }
         }
-
-// #if USING_UNITY_SERIALIZATION
-//         [BurstDiscard]
-//         unsafe void JsonSerializeHostData(NativeList<byte> hostDataBlob, HostDataStorage migrationData)
-//         {
-//             var parameters = new JsonSerializationParameters
-//             {
-//                 UserDefinedAdapters = new List<IJsonAdapter>
-//                 {
-//                     new NativeArrayAdapter<byte>(),
-//                     new NativeArrayAdapter<ulong>(),
-//                     new NativeArrayAdapter<HostConnectionData>(),
-//                     new NativeArrayAdapter<HostSubSceneData>(),
-//                     new NativeArrayAdapter<ConnectionComponent>()
-//                 },
-//                 Minified = true
-//             };
-//
-//             var jsonString = JsonSerialization.ToJson(migrationData, parameters);
-//             if (jsonString.Length > hostDataBlob.Capacity)
-//             {
-//                 hostDataBlob.ResizeUninitialized(2 * jsonString.Length);
-//                 hostDataBlob.Length = 0;
-//             }
-//             var stringBytes = Encoding.UTF8.GetBytes(jsonString);
-//             fixed (byte* stringPtr = stringBytes)
-//             {
-//                 hostDataBlob.AddRange(stringPtr, stringBytes.Length);
-//             }
-//             // TODO: Adding null terminator since these will be converted to strings later and then depend on the termination
-//             // It's easier to add it here than resize the buffer later. Drop this if the conversions can be avoided
-//             hostDataBlob.Add(0);
-//         }
-// #endif
 
         /// <summary>
         /// Get ghost data in the format specified in the HostMigrationConfig. Includes the ghost instance ID,
@@ -975,6 +922,11 @@ namespace Unity.NetCode
                 if (prespawnSceneLoadedLookup.HasBuffer(ghostEntities[i]))
                     continue;
 
+                if (ghostInstances[i].ghostId == 0)
+                {
+                    Debug.LogError($"Trying to send a ghost with an id of 0 this should not be possible. GhostIds are assigned by the GhostSendSystem and this should always run before the migration system ensuring all ghosts have a valid id.");
+                }
+
                 var ghostData = HostMigration.GetGhostComponentData(m_HostMigrationCache, ref state, ghostEntities[i], ghostInstances[i].ghostType, out hasErrors);
 
                 ghostList.Add(new GhostData()
@@ -988,83 +940,9 @@ namespace Unity.NetCode
 
             ghosts.Ghosts = ghostList.AsArray();
 
-#if USING_UNITY_SERIALIZATION
-            if (config.StorageMethod == DataStorageMethod.JsonMinified || config.StorageMethod == DataStorageMethod.Json)
-            {
-                JsonSerializeGhosts(ref state, ghostDataBlob, config, ghosts);
-                return;
-            }
-            if (config.StorageMethod == DataStorageMethod.Binary)
-            {
-                BinarySerializeGhosts(ref state, ghostDataBlob, ghosts);
-                return;
-            }
-#endif
             HostMigration.SerializeGhostData(ref ghosts, ghostDataBlob);
             UpdateGhostStats(ref state, ref ghosts);
         }
-
-#if USING_UNITY_SERIALIZATION
-        [BurstDiscard]
-        unsafe void BinarySerializeGhosts(ref SystemState state, NativeList<byte> ghostDataBlob, GhostStorage ghosts)
-        {
-            byte[] stringBytes;
-            var parameters = new BinarySerializationParameters()
-            {
-                UserDefinedAdapters = new List<IBinaryAdapter>
-                {
-                    new NativeArrayBinaryAdapter<byte>(),
-                    new NativeArrayBinaryAdapter<GhostPrefabData>(),
-                    new NativeArrayBinaryAdapter<GhostData>(),
-                    new NetworkTickBinaryAdapter()
-                }
-            };
-
-            using var stream = new UnsafeAppendBuffer(16, 8, Allocator.Temp);
-            BinarySerialization.ToBinary(&stream, ghosts, parameters);
-            var span = new ReadOnlySpan<byte>(stream.Ptr, (int)stream.Length);
-            var encoded = Convert.ToBase64String(span);
-            stringBytes = Encoding.UTF8.GetBytes(encoded);
-            fixed (byte* stringPtr = stringBytes)
-            {
-                ghostDataBlob.AddRange(stringPtr, stringBytes.Length);
-            }
-            ghostDataBlob.Add(0);
-            UpdateGhostStats(ref state, ref ghosts);
-        }
-
-        [BurstDiscard]
-        unsafe void JsonSerializeGhosts(ref SystemState state, NativeList<byte> ghostDataBlob, HostMigrationConfig config, GhostStorage ghosts)
-        {
-            byte[] stringBytes;
-            var minified = config.StorageMethod == DataStorageMethod.JsonMinified;
-            var parameters = new JsonSerializationParameters
-            {
-                UserDefinedAdapters = new List<IJsonAdapter>
-                {
-                    new NativeArrayAdapter<GhostData>(),
-                    new NativeArrayAdapter<GhostPrefabData>(),
-                    new NativeArrayAdapter<byte>(),
-                    new NetworkTickAdapter()
-                },
-                Minified = minified
-            };
-
-            var jsonString = JsonSerialization.ToJson(ghosts, parameters);
-            if (jsonString.Length > ghostDataBlob.Capacity)
-            {
-                ghostDataBlob.ResizeUninitialized(2*jsonString.Length);
-                ghostDataBlob.Length = 0;
-            }
-            stringBytes = Encoding.UTF8.GetBytes(jsonString);
-            fixed (byte* stringPtr = stringBytes)
-            {
-                ghostDataBlob.AddRange(stringPtr, stringBytes.Length);
-            }
-            ghostDataBlob.Add(0);
-            UpdateGhostStats(ref state, ref ghosts);
-        }
-#endif
 
         void UpdateGhostStats(ref SystemState state, ref GhostStorage ghostStorage)
         {
@@ -1090,7 +968,6 @@ namespace Unity.NetCode
             var builder = new EntityQueryBuilder(Allocator.Temp).WithAll<GhostInstance,GhostOwner>();
             var ghostQuery = state.GetEntityQuery(builder);
             var owners = ghostQuery.ToComponentDataArray<GhostOwner>(Allocator.Temp);
-            var ghostInstance = ghostQuery.ToComponentDataArray<GhostInstance>(Allocator.Temp);
             if (connectionMap.UniqueIdToPreviousNetworkId.TryGetValue(uniqueId.Value, out var previousNetworkId))
             {
                 var newNetworkId = state.EntityManager.GetComponentData<NetworkId>(connectionEntity);
@@ -1098,8 +975,10 @@ namespace Unity.NetCode
                 for (int i = 0; i < owners.Length; ++i)
                 {
                     var ghostEntity = ownerEntities[i];
-                    if (ghostOwnerMap.GhostEntityToPreviousNetworkId[ghostEntity] == previousNetworkId)
-                        commandBuffer.SetComponent(ownerEntities[i], new GhostOwner { NetworkId = newNetworkId.Value});
+                    if (ghostOwnerMap.GhostEntityToPreviousNetworkId.TryGetValue(ghostEntity, out var ghostNetworkId) && ghostNetworkId == previousNetworkId)
+                    {
+                        commandBuffer.SetComponent(ghostEntity, new GhostOwner { NetworkId = newNetworkId.Value});
+                    }
                 }
             }
         }
@@ -1124,34 +1003,6 @@ namespace Unity.NetCode
             }
         }
     }
-
-    [WorldSystemFilter(WorldSystemFilterFlags.ClientSimulation|WorldSystemFilterFlags.ThinClientSimulation)]
-    partial struct TrackClientConnectionUniqueIdSystem : ISystem
-    {
-        public void OnCreate(ref SystemState state)
-        {
-            state.RequireForUpdate<NetworkStreamConnection>();
-        }
-
-        public void OnUpdate(ref SystemState state)
-        {
-            var commandBuffer = new EntityCommandBuffer(Allocator.Temp);
-            foreach (var (uniqueId, entity) in SystemAPI.Query<RefRO<NewConnectionUniqueId>>().WithEntityAccess())
-            {
-                if (SystemAPI.TryGetSingleton<ConnectionUniqueId>(out var connectionUniqueId))
-                {
-                    if (connectionUniqueId.Value == uniqueId.ValueRO.Value)
-                        commandBuffer.DestroyEntity(entity);
-                    else
-                        SystemAPI.SetSingleton(new ConnectionUniqueId(){Value = uniqueId.ValueRO.Value});
-                }
-                else
-                {
-                    commandBuffer.AddComponent(entity, new ConnectionUniqueId() { Value = uniqueId.ValueRO.Value });
-                    commandBuffer.RemoveComponent<NewConnectionUniqueId>(entity);
-                }
-            }
-            commandBuffer.Playback(state.EntityManager);
-        }
-    }
 }
+
+#endif // ENABLE_HOST_MIGRATION
